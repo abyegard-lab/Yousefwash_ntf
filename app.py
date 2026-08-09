@@ -38,7 +38,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 READ_DELAY = 0.5
 WRITE_DELAY = 3
 ETH_PRICE_USD = 3000
-CYCLE_INTERVAL = 24 * 60 * 60
+CYCLE_INTERVAL = 300
 
 # ✅ السعر الافتراضي إذا لم يوجد سعر في السوق: 5 دولار
 DEFAULT_PRICE_USD = 5.0
