@@ -1,6 +1,7 @@
+# main.py - شبكة Ink فقط
 """
 النظام الكامل — 10 محافظ، لكل محفظة بوت تيليجرام خاص بها:
-  - يكتشف مينتات اليوم على Robinhood + Ethereum
+  - يكتشف مينتات اليوم على شبكة Ink فقط
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
   - يرسل إشعار الشراء فقط
   
@@ -57,8 +58,8 @@ for i in range(len(WALLETS)):
         "chat_id": TELEGRAM_CHAT_IDS[i],
     })
 
-ALCHEMY_API_KEY_ROBINHOOD = os.environ["ALCHEMY_API_KEY"]
-ALCHEMY_API_KEY_ETHEREUM = os.environ["ALCHEMY_API_KEY_ETHEREUM"]
+# RPC مجاني لشبكة Ink
+INK_RPC_URL = os.environ.get("INK_RPC_URL", "https://rpc-gel.inkonchain.com/")
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
@@ -78,15 +79,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("auto-buyer")
 
+# تكوين شبكة Ink فقط
 CHAIN_CONFIGS = {
-    "robinhood": {
-        "stream_chain_name": "robinhood",
-        "rpc_url": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ROBINHOOD}",
-        "max_gas_fee_usd": 0.05,
-    },
-    "ethereum": {
-        "stream_chain_name": "ethereum",
-        "rpc_url": f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ETHEREUM}",
+    "ink": {
+        "stream_chain_name": "ink",
+        "rpc_url": INK_RPC_URL,
         "max_gas_fee_usd": 0.50,
     },
 }
@@ -411,7 +408,7 @@ async def log_mint_stages(slug: str, chain_key: str):
     
     analysis = analyze_mint_stages(slug, detail)
     
-    log.info(f"📊 تحليل مراحل المينت: {analysis['name']}")
+    log.info(f"📊 تحليل مراحل المينت: {analysis['name']} [Ink]")
     log.info(f"   📌 الحالة: {analysis['status']}")
     log.info(f"   📋 عدد المراحل: {analysis['total_stages']}")
     
@@ -504,7 +501,7 @@ async def test_telegram():
             bot_token = w["bot_token"]
             chat_id = w["chat_id"]
             
-            test_msg = f"🧪 <b>رسالة اختبار</b>\n\nالبوت #{i+1}\nالمحفظة: {w['wallet'][:8]}...\nالوقت: {datetime.now().strftime('%H:%M:%S')}"
+            test_msg = f"🧪 <b>رسالة اختبار</b>\n\nالبوت #{i+1}\nالمحفظة: {w['wallet'][:8]}...\nالشبكة: Ink\nالوقت: {datetime.now().strftime('%H:%M:%S')}"
             
             telegram_api = f"https://api.telegram.org/bot{bot_token}"
             resp = requests.post(
@@ -531,7 +528,7 @@ def build_startup_message() -> str:
     return (
         f"🚀 <b>تم تشغيل البوت بنجاح!</b>\n\n"
         f"📊 عدد المحافظ: {wallet_count}\n"
-        f"🔗 الشبكات: Robinhood + Ethereum\n"
+        f"🔗 الشبكة: Ink\n"
         f"⚡ الوضع: سريع (اكتشاف فوري + تحليل المراحل)\n"
         f"🔄 جارٍ مراقبة المينتات المجانية..."
     )
@@ -539,7 +536,6 @@ def build_startup_message() -> str:
 def build_purchase_message(detail: dict, result: dict, chain_key: str) -> str:
     name = detail.get("collection_name") or detail.get("collection_slug")
     url = detail.get("opensea_url", "")
-    chain_label = "Robinhood" if chain_key == "robinhood" else "Ethereum"
     w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
     
     bot_stats["mints_purchased"] += 1
@@ -550,7 +546,7 @@ def build_purchase_message(detail: dict, result: dict, chain_key: str) -> str:
     return (
         f"✅ <b>تم الشراء بنجاح!</b>\n\n"
         f"📦 المجموعة: <b>{name}</b>\n"
-        f"🔗 الشبكة: {chain_label}\n"
+        f"🔗 الشبكة: Ink\n"
         f"👛 المحفظة: <code>{w_short}</code>\n"
         f"🔢 الكمية: {result['quantity']}\n"
         f"⛽ رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
@@ -568,10 +564,13 @@ def build_status_message() -> str:
     if bot_stats["purchase_attempts"] > 0:
         success_rate = (bot_stats["mints_purchased"] / bot_stats["purchase_attempts"]) * 100
     
+    ink_mints = bot_stats["mints_per_chain"].get("ink", 0)
+    
     return (
         f"📊 <b>تقرير حالة البوت</b>\n\n"
         f"⏱️ وقت التشغيل: {uptime}\n"
-        f"👛 عدد المحافظ: {len(WALLETS_DATA)}\n\n"
+        f"👛 عدد المحافظ: {len(WALLETS_DATA)}\n"
+        f"🔗 الشبكة: Ink\n\n"
         f"📈 <b>الإحصائيات:</b>\n"
         f"✅ عمليات شراء ناجحة: {bot_stats['mints_purchased']}\n"
         f"🔄 محاولات الشراء: {bot_stats['purchase_attempts']}\n"
@@ -579,7 +578,8 @@ def build_status_message() -> str:
         f"🔍 مينتات مكتشفة: {bot_stats['mints_detected']}\n"
         f"💰 مينتات مدفوعة قيد التتبع: {paid_count}\n"
         f"👀 مينتات تحت المراقبة: {watch_count}\n"
-        f"📦 إجمالي المينتات: {total_mints}\n\n"
+        f"📦 إجمالي المينتات: {total_mints}\n"
+        f"🟣 مينتات Ink: {ink_mints}\n\n"
         f"⛽ إجمالي رسوم الغاز: ${bot_stats['total_gas_spent']:.4f}\n"
         f"📡 طلبات API: {bot_stats['api_calls']}\n"
         f"📨 رسائل تليجرام: {bot_stats['telegram_messages_sent']}\n"
@@ -721,7 +721,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
             if not is_free:
                 # التحقق من وجود مرحلة مجانية قادمة
                 if analysis['has_free_stage']:
-                    log.info(f"⏳ '{slug}' مدفوع حالياً ولكن سيصبح مجانياً - جارٍ التتبع")
+                    log.info(f"⏳ '{slug}' [Ink] مدفوع حالياً ولكن سيصبح مجانياً - جارٍ التتبع")
                     paid_mints_tracking[slug] = {
                         "chain_key": chain_key,
                         "detail": detail,
@@ -731,7 +731,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                         "analysis": analysis
                     }
                 else:
-                    log.info(f"💰 '{slug}' مدفوع فقط - سيتم تجاهله")
+                    log.info(f"💰 '{slug}' [Ink] مدفوع فقط - سيتم تجاهله")
                     mark_rejected(slug)
                 return
 
@@ -819,7 +819,7 @@ async def scan_paid_mints():
                 if not stage:
                     continue
                 
-                chain_key = data.get("chain_key", "ethereum")
+                chain_key = data.get("chain_key", "ink")
                 w3 = W3_INSTANCES[chain_key]
                 eth_price_usd = get_eth_price_usd()
                 contract_address = fresh_detail.get("contract_address")
@@ -833,7 +833,7 @@ async def scan_paid_mints():
                         learn_conversion_pattern(slug, wait_time)
                         bot_stats["conversions_detected"] += 1
                         
-                        log.info(f"🔄 '{slug}' أصبح مجانياً بعد {wait_time:.0f} ثانية!")
+                        log.info(f"🔄 '{slug}' [Ink] أصبح مجانياً بعد {wait_time:.0f} ثانية!")
                         paid_mints_tracking.pop(slug, None)
                         asyncio.create_task(evaluate_new_mint_fast(slug, chain_key))
                     else:
@@ -932,7 +932,7 @@ async def listen_opensea_fast():
     while True:
         try:
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
-                log.info(f"🚀 متصل بـ OpenSea Stream (وضع سريع) — يراقب لـ {len(WALLETS_DATA)} محافظ.")
+                log.info(f"🚀 متصل بـ OpenSea Stream (وضع سريع) — يراقب لـ {len(WALLETS_DATA)} محافظ على شبكة Ink.")
                 join_ref = str(msg_ref)
                 await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                 msg_ref += 1
@@ -971,6 +971,10 @@ async def listen_opensea_fast():
                     if chain_key is None:
                         continue
 
+                    # تجاهل جميع الشبكات ما عدا Ink
+                    if chain_key != "ink":
+                        continue
+
                     from_address = ((payload.get("from_account") or {}).get("address", "") or "").lower()
                     
                     if from_address != ZERO_ADDRESS and event_name == "item_transferred":
@@ -1000,7 +1004,7 @@ async def run():
         return
 
     broadcast_message(build_startup_message())
-    log.info("🚀 تم تشغيل البوت بنجاح (وضع سريع + تحليل المراحل)!")
+    log.info("🚀 تم تشغيل البوت بنجاح (وضع سريع + تحليل المراحل + شبكة Ink)!")
     
     await asyncio.sleep(3)
     await test_telegram()
