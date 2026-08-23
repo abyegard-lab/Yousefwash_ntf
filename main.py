@@ -27,10 +27,10 @@ from buyer import (
 load_dotenv()
 
 # ============================================
-# إعدادات السجلات
+# إعدادات السجلات - مستوى DEBUG
 # ============================================
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # ✅ DEBUG لرؤية كل التفاصيل
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
@@ -119,6 +119,7 @@ total_purchases = 0
 total_gas_fee = 0.0
 start_time = time.time()
 detected_mints = 0
+evaluated_mints = 0
 
 _eth_price_cache = {"value": None, "ts": 0}
 
@@ -150,25 +151,35 @@ def get_eth_price_usd() -> float:
         price = resp.json()["ethereum"]["usd"]
         _eth_price_cache["value"] = price
         _eth_price_cache["ts"] = now
+        log.info(f"💰 سعر ETH: ${price}")
         return price
     except Exception as e:
         log.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
         return _eth_price_cache["value"] or 3000.0
 
 def fetch_drop_detail(slug: str):
+    log.debug(f"🔍 جلب تفاصيل {slug}...")
     try:
         resp = requests.get(
             f"{DROPS_API_BASE}/{slug}",
             headers={"x-api-key": OPENSEA_API_KEY},
             timeout=10,
         )
+        log.debug(f"📡 استجابة {slug}: HTTP {resp.status_code}")
+        
         if resp.status_code == 200:
-            return True, resp.json()
-        if resp.status_code == 404:
+            data = resp.json()
+            # عرض ملخص التفاصيل
+            log.info(f"📋 {slug}: is_minting={data.get('is_minting')}, contract={data.get('contract_address', '')[:8] if data.get('contract_address') else 'None'}")
+            return True, data
+        elif resp.status_code == 404:
+            log.warning(f"⚠️ {slug}: غير موجود (404)")
             return False, None
-        return None, None
+        else:
+            log.warning(f"⚠️ {slug}: HTTP {resp.status_code}")
+            return None, None
     except Exception as e:
-        log.warning(f"[Drops API] خطأ: {e}")
+        log.error(f"❌ خطأ في جلب {slug}: {e}")
         return None, None
 
 def parse_iso(ts: str):
@@ -180,8 +191,13 @@ def parse_iso(ts: str):
 def started_today_local(stage: dict) -> bool:
     start = parse_iso(stage.get("start_time", ""))
     if not start:
+        log.debug(f"⏭️ لا يوجد وقت بداية")
         return False
-    return start.astimezone(LOCAL_TZ).date() == datetime.now(LOCAL_TZ).date()
+    today = datetime.now(LOCAL_TZ).date()
+    start_date = start.astimezone(LOCAL_TZ).date()
+    result = start_date == today
+    log.debug(f"📅 بداية: {start_date}, اليوم: {today} → {result}")
+    return result
 
 def stage_has_ended(stage: dict) -> bool:
     end = parse_iso(stage.get("end_time", ""))
@@ -309,43 +325,63 @@ async def purchase_task_for_wallet(
 
 
 async def try_buy_now_multi_wallet(slug: str, detail: dict) -> list[dict] | None:
+    log.info(f"🔄 بدء محاولة الشراء لـ {slug}")
+    
     stage = detail.get("active_stage")
     if not stage:
+        log.warning(f"⚠️ {slug}: لا يوجد stage")
         return None
+
+    # عرض تفاصيل الـ stage
+    log.info(f"📋 {slug} - stage: start={stage.get('start_time')}, end={stage.get('end_time')}")
+    log.info(f"📋 {slug} - max_per_wallet: {stage.get('max_total_mintable_by_wallet')}")
 
     max_supply = int(detail.get("max_supply") or 0)
     total_supply = int(detail.get("total_supply") or 0)
     remaining = max_supply - total_supply
+    log.info(f"📊 {slug}: max_supply={max_supply}, total={total_supply}, remaining={remaining}")
+    
     if remaining <= 0:
+        log.warning(f"⚠️ {slug}: نفدت الكمية")
         return [{"success": False, "reason": "sold_out"}]
 
     contract_address = detail.get("contract_address")
+    log.info(f"📋 {slug}: contract={contract_address}")
+    
     if not contract_address:
+        log.error(f"❌ {slug}: لا يوجد عنوان عقد")
         return [{"success": False, "reason": "no_contract_address"}]
 
     eth_price_usd = get_eth_price_usd()
 
     # جلب السعر من العقد
+    log.info(f"🔄 جلب السعر من العقد {contract_address[:8]}...")
     onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, W3_INSTANCE, contract_address)
     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
+    
+    price_usd = (price_wei / 1e18) * eth_price_usd
+    log.info(f"💰 {slug}: السعر = {price_wei} wei (${price_usd:.8f})")
 
     # التحقق من المجانية
     if not is_free_mint(price_wei, eth_price_usd):
-        log.info(f"⏭️ '{slug}': ليس مجانياً - تخطي")
+        log.info(f"⏭️ {slug}: ليس مجانياً (${price_usd:.8f}) - تخطي")
         return None
 
     # جلب الحد الأقصى من العقد
+    log.info(f"🔄 جلب max_per_wallet من العقد...")
     max_per_wallet = await asyncio.to_thread(get_max_per_wallet, W3_INSTANCE, contract_address)
     if max_per_wallet is None or max_per_wallet <= 0:
         max_per_wallet = int(stage.get("max_total_mintable_by_wallet") or 5)
+    log.info(f"📊 {slug}: حد المحفظة = {max_per_wallet}")
 
     already_bought_wallets = successful_mints.get(slug, set())
     pending_items = [item for item in WALLETS_DATA if item["wallet"] not in already_bought_wallets]
 
     if not pending_items:
+        log.info(f"✅ {slug}: جميع المحافظ اكتملت")
         return [{"success": False, "reason": "all_wallets_completed"}]
 
-    log.info(f"🔄 شراء {slug} لـ {len(pending_items)} محافظ")
+    log.info(f"🔄 {slug}: شراء لـ {len(pending_items)} محافظ")
 
     for item in pending_items:
         item["current_detail"] = detail
@@ -371,59 +407,115 @@ async def try_buy_now_multi_wallet(slug: str, detail: dict) -> list[dict] | None
 # ============================================
 
 async def evaluate_new_mint(slug: str):
-    global detected_mints
+    global detected_mints, evaluated_mints
     
-    if (
-        len(successful_mints.get(slug, set())) >= len(WALLETS_DATA)
-        or slug in watchlist
-        or slug in in_flight
-        or is_in_cooldown(slug)
-    ):
+    evaluated_mints += 1
+    log.info(f"🔍 [{evaluated_mints}] تقييم {slug}...")
+    
+    # التحقق من التكرار
+    if slug in watchlist:
+        log.info(f"⏭️ {slug}: موجود في قائمة المراقبة")
+        return
+        
+    if slug in in_flight:
+        log.info(f"⏭️ {slug}: قيد المعالجة")
+        return
+        
+    if is_in_cooldown(slug):
+        log.info(f"⏭️ {slug}: في فترة التبريد")
+        return
+        
+    if len(successful_mints.get(slug, set())) >= len(WALLETS_DATA):
+        log.info(f"✅ {slug}: جميع المحافظ اكتملت")
         return
 
     in_flight.add(slug)
     try:
         found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
-        if not found or not detail or not detail.get("is_minting"):
+        
+        if not found:
+            log.warning(f"⚠️ {slug}: غير موجود")
+            mark_rejected(slug)
             return
-
-        stage = detail.get("active_stage")
-        if not stage or not started_today_local(stage):
-            return
-
-        contract_address = detail.get("contract_address")
-        if not contract_address:
-            return
-
-        eth_price_usd = get_eth_price_usd()
-        onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, W3_INSTANCE, contract_address)
-        price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
-
-        if not is_free_mint(price_wei, eth_price_usd):
-            price_usd = (price_wei / 1e18) * eth_price_usd
-            log.info(f"⏭️ '{slug}': ليس مجانياً (${price_usd:.6f})")
+            
+        if not detail:
+            log.warning(f"⚠️ {slug}: لا توجد تفاصيل")
             mark_rejected(slug)
             return
 
-        # ✅ اكتشاف مينت مجاني
-        detected_mints += 1
-        log.info(f"✅ '{slug}': مينت مجاني نشط — بدء الشراء!")
+        # ✅ عرض جميع التفاصيل المهمة
+        log.info(f"📋 {slug} - is_minting: {detail.get('is_minting')}")
+        log.info(f"📋 {slug} - collection_name: {detail.get('collection_name')}")
+        log.info(f"📋 {slug} - contract_address: {detail.get('contract_address')}")
+        log.info(f"📋 {slug} - max_supply: {detail.get('max_supply')}")
+        log.info(f"📋 {slug} - total_supply: {detail.get('total_supply')}")
 
+        # ✅ التحقق من is_minting
+        if not detail.get("is_minting"):
+            log.info(f"⏭️ {slug}: ليس في حالة minting (is_minting=false)")
+            mark_rejected(slug)
+            return
+
+        # ✅ التحقق من active_stage
+        stage = detail.get("active_stage")
+        if not stage:
+            log.info(f"⏭️ {slug}: لا يوجد active_stage")
+            mark_rejected(slug)
+            return
+
+        # ✅ التحقق من وقت البدء
+        log.info(f"📋 {slug} - start_time: {stage.get('start_time')}")
+        log.info(f"📋 {slug} - end_time: {stage.get('end_time')}")
+        
+        if not started_today_local(stage):
+            log.info(f"⏭️ {slug}: لم يبدأ اليوم")
+            mark_rejected(slug)
+            return
+
+        # ✅ التحقق من العقد
+        contract_address = detail.get("contract_address")
+        if not contract_address:
+            log.info(f"⏭️ {slug}: لا يوجد عنوان عقد")
+            mark_rejected(slug)
+            return
+
+        # ✅ التحقق من السعر
+        eth_price_usd = get_eth_price_usd()
+        onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, W3_INSTANCE, contract_address)
+        price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
+        
+        price_usd = (price_wei / 1e18) * eth_price_usd
+        log.info(f"💰 {slug}: السعر = {price_wei} wei (${price_usd:.8f})")
+
+        if not is_free_mint(price_wei, eth_price_usd):
+            log.info(f"⏭️ {slug}: ليس مجانياً (${price_usd:.8f}) - تخطي")
+            mark_rejected(slug)
+            return
+
+        # ✅ اكتشاف مينت مجاني!
+        detected_mints += 1
+        log.info(f"✅✅ {slug}: مينت مجاني نشط! (المكتشف #{detected_mints})")
+        
         # إرسال إشعار اكتشاف
         msg = build_detection_message(detail)
         broadcast_message(msg)
 
+        # محاولة الشراء
         results = await try_buy_now_multi_wallet(slug, detail)
 
         if results is None:
             watchlist[slug] = {"detail": detail}
+            log.info(f"👀 {slug}: تمت إضافته للمراقبة")
             return
 
         if len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
             watchlist[slug] = {"detail": detail}
+            log.info(f"👀 {slug}: تمت إضافته للمراقبة (لم تكتمل جميع المحافظ)")
 
     except Exception as e:
-        log.error(f"خطأ بتقييم '{slug}': {e}")
+        log.error(f"❌ خطأ بتقييم '{slug}': {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         in_flight.discard(slug)
 
@@ -443,10 +535,12 @@ async def watch_loop():
             log.info("=" * 50)
             log.info(f"📊 تقرير الحالة - {hours}h {minutes}m")
             log.info(f"💰 المحافظ: {len(WALLETS_DATA)}")
-            log.info(f"✅ مشتريات ناجحة: {total_purchases}")
-            log.info(f"⛽ إجمالي رسوم الغاز: ${total_gas_fee:.4f}")
-            log.info(f"🔍 مينتات مكتشفة: {detected_mints}")
+            log.info(f"🔍 مينتات مقيمة: {evaluated_mints}")
+            log.info(f"✅ مينتات مكتشفة: {detected_mints}")
+            log.info(f"🛒 مشتريات ناجحة: {total_purchases}")
+            log.info(f"⛽ رسوم الغاز: ${total_gas_fee:.4f}")
             log.info(f"👀 تحت المراقبة: {len(watchlist)}")
+            log.info(f"📌 المينتات الناجحة: {list(successful_mints.keys())}")
             log.info("=" * 50)
             last_status_time = time.time()
         
@@ -552,6 +646,7 @@ async def listen_opensea():
                     # ✅ منع التكرار
                     now = time.time()
                     if slug in processed_slugs and now - processed_slugs[slug] < MIN_INTERVAL:
+                        log.debug(f"⏭️ {slug}: مكرر ({now - processed_slugs[slug]:.1f}s)")
                         continue
                     processed_slugs[slug] = now
 
