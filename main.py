@@ -1,6 +1,7 @@
 """
 النظام الكامل — 10 محافظ، لكل محفظة بوت تيليجرام خاص بها:
   - يكتشف المينتات المجانية فقط على شبكة Ink
+  - يتحقق من وجود حساب تويتر/إكس
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
   - يرسل إشعار الشراء لكل محفظة على بوت التيليجرام الخاص بها
 """
@@ -22,6 +23,7 @@ from buyer import (
     get_onchain_public_price_wei,
     get_wallet_lock,
 )
+from twitter_checker import get_twitter_username_from_opensea
 
 load_dotenv()
 
@@ -209,11 +211,12 @@ async def telegram_sender():
 def build_startup_message() -> str:
     now = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
     return (
-        f"🚀 <b>تم تشغيل نظام الشراء التلقائي - Ink (مجاني فقط)</b>\n\n"
+        f"🚀 <b>تم تشغيل نظام الشراء التلقائي - Ink (مجاني فقط + تويتر)</b>\n\n"
         f"📅 الوقت: {now}\n"
         f"💰 عدد المحافظ: {len(WALLETS_DATA)}\n"
         f"🔗 الشبكة: Ink\n"
         f"🆓 الوضع: المجاني فقط (أقل من ${FREE_PRICE_THRESHOLD_USD})\n"
+        f"🐦 شرط تويتر: مطلوب\n"
         f"⏳ جاهز لرصد المينتات المجانية..."
     )
 
@@ -354,7 +357,14 @@ async def evaluate_new_mint(slug: str):
                 mark_rejected(slug)
                 return
 
-        log.info(f"✅ '{slug}': مينت مجاني نشط اليوم — المتابعة للشراء.")
+        # ✅ التحقق من تويتر/إكس - شرط أساسي
+        twitter_username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
+        if not twitter_username:
+            log.info(f"⏭️ تجاهل '{slug}': لا يوجد حساب X مربوط.")
+            mark_rejected(slug)
+            return
+
+        log.info(f"✅ '{slug}': يوجد حساب X مربوط (@{twitter_username}) — المتابعة للشراء.")
 
         results = await try_buy_now_multi_wallet(slug, detail)
 
@@ -412,6 +422,13 @@ async def watch_loop():
                         watchlist.pop(slug, None)
                         continue
 
+                # ✅ التحقق من تويتر مرة أخرى في دورة المراقبة
+                twitter_username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
+                if not twitter_username:
+                    log.info(f"⏭️ '{slug}': فقد حساب X - إزالة من المراقبة")
+                    watchlist.pop(slug, None)
+                    continue
+
                 results = await try_buy_now_multi_wallet(slug, fresh_detail)
 
                 if results is None:
@@ -431,6 +448,9 @@ async def watch_loop():
 
 async def listen_opensea():
     msg_ref = 0
+    # ✅ تجاهل الأحداث غير المرغوب فيها لتقليل الضوضاء
+    ignored_events = {"item_cancelled", "item_updated", "item_metadata_updated", "item_sold"}
+    
     while True:
         try:
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
@@ -460,6 +480,10 @@ async def listen_opensea():
                     if isinstance(parsed, list) and len(parsed) == 5:
                         _jref, _ref, _topic, event_name, payload_wrapper = parsed
                     else:
+                        continue
+
+                    # ✅ تجاهل الأحداث غير المهمة
+                    if event_name in ignored_events:
                         continue
 
                     if event_name != "item_transferred":
