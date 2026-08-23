@@ -4,8 +4,9 @@
 
 import asyncio
 import logging
+import traceback
 from web3 import Web3
-from web3.exceptions import ContractLogicError
+from web3.exceptions import ContractLogicError, ContractPanicError
 
 log = logging.getLogger("buyer")
 
@@ -57,9 +58,10 @@ SEADROP_ABI = [
 MIN_BALANCE_RESERVE_USD = 0.05
 FEW_THRESHOLD = 20
 LIMITED_BUY_QTY = 15
-MIN_BUY_QTY = 10  # ✅ الحد الأدنى للشراء = 10
+MIN_BUY_QTY = 10
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 FREE_PRICE_THRESHOLD_USD = 0.01
+MAX_GAS_LIMIT = 500000  # حد أقصى للغاز
 
 # قفل خاص لكل محفظة
 wallet_locks = {}
@@ -72,7 +74,7 @@ def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
 
 
 def get_web3(rpc_url: str) -> Web3:
-    return Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 30}))
+    return Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 60}))
 
 
 def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) -> float:
@@ -85,8 +87,7 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) 
         return 0.0
 
 
-def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 250_000) -> float:
-    """تقدير رسوم الغاز - زيادة الوحدات لتغطية الكمية الأكبر"""
+def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 300_000) -> float:
     try:
         gas_price_wei = w3.eth.gas_price
         fee_eth = (gas_price_wei * gas_units) / 1e18
@@ -111,27 +112,18 @@ def get_fee_recipient(w3: Web3, nft_contract: str) -> str | None:
 
 
 def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
-    """
-    تحديد الكمية المناسبة للشراء
-    - الحد الأدنى 10 للمينتات المجانية
-    """
-    # ✅ الحد الأدنى 10
     if max_per_wallet is None:
-        qty = MIN_BUY_QTY  # 10
+        qty = MIN_BUY_QTY
     elif max_per_wallet <= FEW_THRESHOLD:
         qty = max_per_wallet
-        # إذا كان الحد الأقصى أقل من 10، نشتري الحد الأقصى
         if qty < MIN_BUY_QTY:
             qty = min(max_per_wallet, remaining_supply)
     else:
         qty = min(LIMITED_BUY_QTY, remaining_supply)
-        # التأكد من أن الكمية لا تقل عن 10
         if qty < MIN_BUY_QTY:
             qty = min(MIN_BUY_QTY, remaining_supply)
     
-    # التأكد من أن الكمية بين 10 والحد الأقصى المتاح
-    final_qty = max(MIN_BUY_QTY, min(qty, remaining_supply))
-    
+    final_qty = max(1, min(qty, remaining_supply))
     log.info(f"[تحديد الكمية] الحد الأقصى: {max_per_wallet}, المتبقي: {remaining_supply} → الكمية: {final_qty}")
     return final_qty
 
@@ -191,59 +183,118 @@ def attempt_purchase_single_wallet(
     if not fee_recipient:
         return {"success": False, "wallet": checksum_wallet, "reason": "no_fee_recipient"}
 
-    # ✅ تحديد الكمية (الحد الأدنى 10)
+    # تحديد الكمية
     quantity = decide_quantity(max_per_wallet, remaining_supply)
-    total_value = price_wei_per_token * quantity  # = 0 للمجاني
+    total_value = price_wei_per_token * quantity
 
-    log.info(f"[محاولة شراء] {checksum_wallet[:8]}... كمية: {quantity}, السعر: {(price_wei_per_token/1e18)*eth_price_usd:.6f}$")
+    log.info(f"[محاولة شراء] {checksum_wallet[:8]}... كمية: {quantity}, السعر: {(price_wei_per_token/1e18)*eth_price_usd:.8f}$")
 
     try:
         contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
+        gas_price = w3.eth.gas_price
+
+        log.info(f"[معاملة] nonce: {nonce}, gas_price: {gas_price/1e9:.2f} Gwei")
 
         # بناء المعاملة
-        tx_data = {
-            "from": checksum_wallet,
-            "value": total_value,
-            "nonce": nonce,
-            "chainId": w3.eth.chain_id,
-            "gas": 300000,  # ✅ زيادة الغاز الافتراضي للكميات الكبيرة
-            "gasPrice": w3.eth.gas_price,
-        }
-
-        # بناء المعاملة عبر contract
         tx = contract.functions.mintPublic(
             checksum_contract,
             Web3.to_checksum_address(fee_recipient),
             ZERO_ADDRESS,
             quantity,
-        ).build_transaction(tx_data)
+        ).build_transaction({
+            "from": checksum_wallet,
+            "value": total_value,
+            "nonce": nonce,
+            "chainId": w3.eth.chain_id,
+            "gasPrice": gas_price,
+        })
 
         # محاولة تقدير الغاز الفعلي
+        estimated_gas = None
         try:
             estimated_gas = w3.eth.estimate_gas(tx)
             tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
             log.info(f"[تقدير الغاز] {checksum_wallet[:8]}...: {estimated_gas} → {tx['gas']}")
+        except ContractPanicError as e:
+            # خطأ في العقد (panic)
+            error_msg = str(e)
+            log.error(f"[خطأ عقد - Panic] {checksum_wallet[:8]}...: {error_msg[:200]}")
+            
+            # محاولة فهم الخطأ
+            if "reverted" in error_msg.lower():
+                return {
+                    "success": False, 
+                    "wallet": checksum_wallet, 
+                    "reason": "contract_reverted",
+                    "error": error_msg[:300]
+                }
+            else:
+                tx["gas"] = 300000
+                log.warning(f"[استخدام غاز افتراضي] {checksum_wallet[:8]}...: 300000")
+                
         except ContractLogicError as e:
-            log.warning(f"[محاكاة فاشلة] {checksum_wallet[:8]}...: {e}")
-            tx["gas"] = 300000  # ✅ قيمة افتراضية للكميات الكبيرة
+            # خطأ منطق العقد
+            error_msg = str(e)
+            log.error(f"[خطأ عقد - Logic] {checksum_wallet[:8]}...: {error_msg[:200]}")
+            
+            # التحقق من أسباب محددة
+            if "out of gas" in error_msg.lower():
+                tx["gas"] = 400000
+                log.info(f"[زيادة الغاز] {checksum_wallet[:8]}...: 400000")
+            elif "execution reverted" in error_msg.lower():
+                return {
+                    "success": False, 
+                    "wallet": checksum_wallet, 
+                    "reason": "execution_reverted",
+                    "error": "العقد رفض المعاملة - قد يكون المينت انتهى أو الكمية غير متاحة"
+                }
+            else:
+                tx["gas"] = 300000
+                log.warning(f"[استخدام غاز افتراضي] {checksum_wallet[:8]}...: 300000")
+                
         except Exception as e:
-            log.warning(f"[تقدير الغاز] {checksum_wallet[:8]}...: {e}")
+            # أي خطأ آخر في التقدير
+            log.warning(f"[تقدير الغاز - خطأ] {checksum_wallet[:8]}...: {type(e).__name__}: {str(e)[:200]}")
             tx["gas"] = 300000
+            log.info(f"[استخدام غاز افتراضي] {checksum_wallet[:8]}...: 300000")
+
+        # التأكد من أن الغاز ضمن الحدود
+        if tx.get("gas", 0) > MAX_GAS_LIMIT:
+            log.warning(f"[تجاوز حد الغاز] {checksum_wallet[:8]}...: {tx['gas']} → تخفيض إلى {MAX_GAS_LIMIT}")
+            tx["gas"] = MAX_GAS_LIMIT
 
         # التحقق من رسوم الغاز
         actual_gas_fee_usd = (tx["gas"] * tx["gasPrice"] / 1e18) * eth_price_usd
         if actual_gas_fee_usd > max_gas_fee_usd:
-            return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": actual_gas_fee_usd}
+            return {
+                "success": False, 
+                "wallet": checksum_wallet, 
+                "reason": "gas_too_high", 
+                "gas_fee_usd": actual_gas_fee_usd,
+                "max_gas_fee_usd": max_gas_fee_usd
+            }
 
         # التحقق من الرصيد الكافي
         total_cost_wei = total_value + (tx["gas"] * tx["gasPrice"])
         wallet_balance_wei = w3.eth.get_balance(checksum_wallet)
+        
+        log.info(f"[الرصيد] {checksum_wallet[:8]}...: {wallet_balance_wei/1e18:.6f} ETH, التكلفة: {total_cost_wei/1e18:.6f} ETH")
+        
         if wallet_balance_wei < total_cost_wei:
-            return {"success": False, "wallet": checksum_wallet, "reason": "insufficient_funds"}
+            return {
+                "success": False, 
+                "wallet": checksum_wallet, 
+                "reason": "insufficient_funds",
+                "balance_eth": wallet_balance_wei/1e18,
+                "cost_eth": total_cost_wei/1e18
+            }
 
         # توقيع وإرسال المعاملة
+        log.info(f"[توقيع المعاملة] {checksum_wallet[:8]}...")
         signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
+        
+        log.info(f"[إرسال المعاملة] {checksum_wallet[:8]}...")
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
 
         log.info(f"[✅ شراء ناجح - {checksum_wallet[:8]}] {tx_hash.hex()} — كمية: {quantity}")
@@ -254,11 +305,34 @@ def attempt_purchase_single_wallet(
             "quantity": quantity,
             "gas_fee_usd": actual_gas_fee_usd,
             "total_value_wei": total_value,
+            "gas_used": tx["gas"],
         }
 
+    except ContractPanicError as e:
+        log.error(f"[خطأ عقد - Panic] {checksum_wallet[:8]}...: {str(e)[:300]}")
+        return {
+            "success": False, 
+            "wallet": checksum_wallet, 
+            "reason": "contract_panic",
+            "error": str(e)[:300]
+        }
+        
     except ContractLogicError as e:
-        log.error(f"[خطأ منطق العقد - {checksum_wallet[:8]}] {e}")
-        return {"success": False, "wallet": checksum_wallet, "reason": "contract_error", "error": str(e)}
+        log.error(f"[خطأ عقد - Logic] {checksum_wallet[:8]}...: {str(e)[:300]}")
+        return {
+            "success": False, 
+            "wallet": checksum_wallet, 
+            "reason": "contract_logic_error",
+            "error": str(e)[:300]
+        }
+        
     except Exception as e:
-        log.error(f"[خطأ إرسال - {checksum_wallet[:8]}] {type(e).__name__}: {e}")
-        return {"success": False, "wallet": checksum_wallet, "reason": "tx_error", "error": str(e)}
+        log.error(f"[خطأ إرسال - {checksum_wallet[:8]}] {type(e).__name__}: {str(e)[:300]}")
+        log.debug(traceback.format_exc())
+        return {
+            "success": False, 
+            "wallet": checksum_wallet, 
+            "reason": "tx_error",
+            "error_type": type(e).__name__,
+            "error": str(e)[:300]
+        }
