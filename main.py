@@ -1,4 +1,4 @@
-# main.py - مع التحسينات المطلوبة فقط
+# main.py - مع التحقق من وجود حساب X فقط (بدون فحص القوة)
 """
 النظام الكامل — 10 محافظ، لكل محفظة بوت تيليجرام خاص بها:
   - يكتشف مينتات اليوم على شبكة Ink فقط
@@ -8,10 +8,10 @@
 تحسينات السرعة:
 - قبول المزيد من أنواع الأحداث من WebSocket
 - استخدام Session لإعادة استخدام الاتصالات
-- جلب Twitter غير متزامن في الخلفية
 - تخزين مؤقت لمنع التكرار
 - زيادة التزامن إلى 10 مهام متوازية
 - تقليل مهلات الطلبات
+- التحقق من وجود حساب X فقط (بدون فحص القوة)
 """
 
 import asyncio
@@ -109,12 +109,12 @@ discovered_mints: set[str] = set()
 
 DROP_CACHE_DURATION = 5  # 5 ثواني
 TWITTER_CACHE_DURATION = 600  # 10 دقائق
-MAX_PARALLEL_TASKS = 10  # ✅ زيادة من 3 إلى 10
+MAX_PARALLEL_TASKS = 10
 
-# ✅ إضافة سيمفور للتحكم في التزامن
+# إضافة سيمفور للتحكم في التزامن
 semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
 
-# ✅ استخدام Session لإعادة استخدام الاتصالات
+# استخدام Session لإعادة استخدام الاتصالات
 _session = None
 
 def get_session():
@@ -242,7 +242,7 @@ def get_eth_price_usd() -> float:
         log.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
         return _eth_price_cache["value"] or 3000.0
 
-# ✅ تحسين fetch_drop_detail باستخدام Session
+# تحسين fetch_drop_detail باستخدام Session
 def fetch_drop_detail(slug: str):
     cached = get_cached_drop(slug)
     if cached is not None:
@@ -252,7 +252,7 @@ def fetch_drop_detail(slug: str):
         session = get_session()
         resp = session.get(
             f"{DROPS_API_BASE}/{slug}",
-            timeout=5,  # ✅ تقليل المهلة من 10 إلى 5
+            timeout=5,
         )
         bot_stats["api_calls"] += 1
         if resp.status_code == 200:
@@ -544,6 +544,7 @@ def build_startup_message() -> str:
         f"📊 عدد المحافظ: {wallet_count}\n"
         f"🔗 الشبكة: Ink\n"
         f"⚡ الوضع: فائق السرعة (اكتشاف فوري + 10 مهام متوازية)\n"
+        f"🔒 التحقق: وجود حساب X فقط (بدون فحص القوة)\n"
         f"🔄 جارٍ مراقبة المينتات المجانية..."
     )
 
@@ -585,7 +586,8 @@ def build_status_message() -> str:
         f"⏱️ وقت التشغيل: {uptime}\n"
         f"👛 عدد المحافظ: {len(WALLETS_DATA)}\n"
         f"🔗 الشبكة: Ink\n"
-        f"⚡ المهام المتوازية: {MAX_PARALLEL_TASKS}\n\n"
+        f"⚡ المهام المتوازية: {MAX_PARALLEL_TASKS}\n"
+        f"🔒 التحقق: وجود حساب X فقط\n\n"
         f"📈 <b>الإحصائيات:</b>\n"
         f"✅ عمليات شراء ناجحة: {bot_stats['mints_purchased']}\n"
         f"🔄 محاولات الشراء: {bot_stats['purchase_attempts']}\n"
@@ -686,30 +688,16 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict):
     results = await asyncio.gather(*tasks)
     return list(results)
 
-# ✅ وظيفة جلب Twitter غير متزامنة في الخلفية
-async def fetch_twitter_async(slug: str):
-    """جلب تويتر في الخلفية دون انتظار"""
-    try:
-        username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
-        set_cached_twitter(slug, username)
-        if not username:
-            mark_rejected(slug)
-    except Exception as e:
-        log.debug(f"خطأ في جلب تويتر لـ {slug}: {e}")
-
 # ---------------------------------------------------------------------------
-# تقييم المينتات السريع (مع تحسينات)
+# تقييم المينتات السريع (مع التحقق من وجود X فقط)
 # ---------------------------------------------------------------------------
 
 async def evaluate_new_mint_fast(slug: str, chain_key: str):
     """
-    نسخة فائقة السرعة مع تحسينات:
-    - استخدام سيمفور للتحكم في التزامن
-    - جلب Twitter غير متزامن
-    - معالجة أسرع
+    نسخة فائقة السرعة - تتحقق فقط من وجود حساب X (بدون فحص القوة)
     """
-    async with semaphore:  # ✅ التحكم في التزامن
-        # ✅ فحص سريع جداً
+    async with semaphore:
+        # فحص سريع جداً
         if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
             return
         
@@ -721,7 +709,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
 
         in_flight.add(slug)
         try:
-            # ✅ جلب التفاصيل مع مهلة قصيرة
+            # جلب التفاصيل مع مهلة قصيرة
             found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
             if not found or not detail or not detail.get("is_minting"):
                 in_flight.discard(slug)
@@ -732,17 +720,17 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                 in_flight.discard(slug)
                 return
 
-            # ✅ تحليل المراحل (بدون سجلات كثيرة)
+            # تحليل المراحل
             analysis = analyze_mint_stages(slug, detail)
             
-            # ✅ تسجيل المينتات الجديدة فقط
+            # تسجيل المينتات الجديدة فقط
             if slug not in discovered_mints:
                 log.info(f"🆕 مينت جديد: {slug} [Ink] - {analysis['status']}")
                 discovered_mints.add(slug)
 
             bot_stats["mints_detected"] += 1
 
-            # ✅ فحص السعر بدون انتظار طويل
+            # فحص السعر
             w3 = W3_INSTANCES[chain_key]
             eth_price_usd = get_eth_price_usd()
             contract_address = detail.get("contract_address")
@@ -773,18 +761,29 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                     in_flight.discard(slug)
                     return
 
-            # ✅ فحص Twitter بشكل غير متزامن (لا ننتظر النتيجة)
+            # ✅ التحقق من وجود حساب X فقط (بدون فحص القوة)
             twitter_username = get_cached_twitter(slug)
             if twitter_username is None:
-                # ✅ نطلق المهمة في الخلفية ولا ننتظرها
-                asyncio.create_task(fetch_twitter_async(slug))
-                # ✅ نعتبره مقبولاً مؤقتاً
-            else:
-                # ✅ إذا كان لدينا تويتر مخبأ
-                if not twitter_username:
-                    mark_rejected(slug)
-                    in_flight.discard(slug)
-                    return
+                try:
+                    twitter_username = await asyncio.to_thread(
+                        get_twitter_username_from_opensea, 
+                        slug, 
+                        OPENSEA_API_KEY
+                    )
+                    set_cached_twitter(slug, twitter_username)
+                except Exception as e:
+                    log.debug(f"خطأ في جلب تويتر لـ {slug}: {e}")
+                    twitter_username = None
+            
+            # ❌ رفض فقط إذا لم يكن لديه حساب X على الإطلاق
+            if twitter_username is None:
+                log.info(f"❌ '{slug}' [Ink] مرفوض - لا يوجد حساب X")
+                mark_rejected(slug)
+                in_flight.discard(slug)
+                return
+
+            # ✅ يوجد حساب X - نقبل المينت
+            log.info(f"✅ '{slug}' [Ink] يوجد حساب X: @{twitter_username}")
 
             # ✅ محاولة الشراء فوراً
             results = await try_buy_now_multi_wallet(slug, chain_key, detail)
@@ -965,12 +964,12 @@ async def watch_loop():
                 in_flight.discard(slug)
 
 # ---------------------------------------------------------------------------
-# الاستماع السريع إلى OpenSea (مع تحسينات)
+# الاستماع السريع إلى OpenSea
 # ---------------------------------------------------------------------------
 
 async def listen_opensea_fast():
     msg_ref = 0
-    # ✅ تخزين مؤقت لمنع التكرار
+    # تخزين مؤقت لمنع التكرار
     recent_mints = {}
     RECENT_WINDOW = 2  # ثواني
     
@@ -978,6 +977,7 @@ async def listen_opensea_fast():
         try:
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
                 log.info(f"🚀 متصل بـ OpenSea Stream (وضع فائق السرعة) — يراقب لـ {len(WALLETS_DATA)} محافظ على شبكة Ink.")
+                log.info(f"🔒 التحقق: وجود حساب X فقط (بدون فحص القوة)")
                 join_ref = str(msg_ref)
                 await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                 msg_ref += 1
@@ -1005,7 +1005,7 @@ async def listen_opensea_fast():
                     else:
                         continue
 
-                    # ✅ قبول المزيد من أنواع الأحداث
+                    # قبول المزيد من أنواع الأحداث
                     if event_name not in ["item_transferred", "item_listed", "collection_created", "item_received", "item_sold"]:
                         continue
 
@@ -1017,7 +1017,7 @@ async def listen_opensea_fast():
                     if chain_key is None:
                         continue
 
-                    # ✅ فقط Ink
+                    # فقط Ink
                     if chain_key != "ink":
                         continue
 
@@ -1025,28 +1025,28 @@ async def listen_opensea_fast():
                     if not slug:
                         continue
 
-                    # ✅ منع التكرار المتكرر
+                    # منع التكرار المتكرر
                     now = time.time()
                     if slug in recent_mints:
                         if now - recent_mints[slug] < RECENT_WINDOW:
                             continue
                     recent_mints[slug] = now
 
-                    # ✅ تنظيف الذاكرة المؤقتة
+                    # تنظيف الذاكرة المؤقتة
                     for s in list(recent_mints.keys()):
                         if now - recent_mints[s] > 60:
                             del recent_mints[s]
 
-                    # ✅ معالجة فورية
+                    # معالجة فورية
                     asyncio.create_task(evaluate_new_mint_fast(slug, chain_key))
 
         except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
             log.warning(f"انقطع الاتصال ({e}). إعادة الاتصال...")
-            await asyncio.sleep(1)  # ✅ تقليل وقت الانتظار
+            await asyncio.sleep(1)
         except Exception as e:
             log.error(f"خطأ غير متوقع: {e}.")
             bot_stats["errors"] += 1
-            await asyncio.sleep(1)  # ✅ تقليل وقت الانتظار
+            await asyncio.sleep(1)
 
 # ==================== التشغيل الرئيسي ====================
 
@@ -1059,6 +1059,7 @@ async def run():
 
     broadcast_message(build_startup_message())
     log.info("🚀 تم تشغيل البوت بنجاح (وضع فائق السرعة + 10 مهام متوازية + شبكة Ink)!")
+    log.info("🔒 التحقق: وجود حساب X فقط (بدون فحص القوة)")
     
     await asyncio.sleep(3)
     await test_telegram()
