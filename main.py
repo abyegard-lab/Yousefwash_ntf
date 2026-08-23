@@ -1,6 +1,6 @@
 """
 النظام الكامل — 10 محافظ، لكل محفظة بوت تيليجرام خاص بها:
-  - يكتشف جميع المينتات على شبكة Ink
+  - يكتشف المينتات المجانية فقط على شبكة Ink
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
   - يرسل إشعار الشراء لكل محفظة على بوت التيليجرام الخاص بها
 """
@@ -49,7 +49,6 @@ for i in range(len(WALLETS)):
 
 # رابط RPC الخاص بـ Ink - يتم استيراده من ملف .env
 INK_RPC_URL = os.environ.get("INK_RPC_URL", "https://rpc-gel.inkonchain.com")
-ALCHEMY_API_KEY_ETHEREUM = os.environ.get("ALCHEMY_API_KEY_ETHEREUM", "")  # لم يعد مستخدماً لكن للحفاظ على التوافق
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
@@ -59,7 +58,7 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-FREE_PRICE_THRESHOLD_USD = 0.01
+FREE_PRICE_THRESHOLD_USD = 0.01  # حد السعر المجاني (أقل من سنت)
 WATCH_POLL_INTERVAL_SECONDS = 15
 
 logging.basicConfig(
@@ -72,9 +71,9 @@ log = logging.getLogger("auto-buyer")
 # تكوين شبكة Ink فقط
 CHAIN_CONFIGS = {
     "ink": {
-        "stream_chain_name": "ink",  # الاسم في OpenSea Stream
+        "stream_chain_name": "ink",
         "rpc_url": INK_RPC_URL,
-        "max_gas_fee_usd": 0.05,  # رسوم الغاز منخفضة على Ink
+        "max_gas_fee_usd": 0.05,
         "chain_label": "Ink",
     },
 }
@@ -165,6 +164,7 @@ def stage_has_ended(stage: dict) -> bool:
 
 
 def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
+    """التحقق من أن السعر مجاني أو أقل من الحد المسموح"""
     price_usd = (price_wei / 1e18) * eth_price_usd
     return price_usd < FREE_PRICE_THRESHOLD_USD
 
@@ -209,11 +209,12 @@ async def telegram_sender():
 def build_startup_message() -> str:
     now = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
     return (
-        f"🚀 <b>تم تشغيل نظام الشراء التلقائي - Ink</b>\n\n"
+        f"🚀 <b>تم تشغيل نظام الشراء التلقائي - Ink (مجاني فقط)</b>\n\n"
         f"📅 الوقت: {now}\n"
         f"💰 عدد المحافظ: {len(WALLETS_DATA)}\n"
         f"🔗 الشبكة: Ink\n"
-        f"⏳ جاهز لرصد جميع المينتات..."
+        f"🆓 الوضع: المجاني فقط (أقل من ${FREE_PRICE_THRESHOLD_USD})\n"
+        f"⏳ جاهز لرصد المينتات المجانية..."
     )
 
 
@@ -286,8 +287,10 @@ async def try_buy_now_multi_wallet(slug: str, detail: dict) -> list[dict] | None
     onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, W3_INSTANCE, contract_address)
     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
 
-    # شراء جميع المينتات بغض النظر عن السعر (مجاني أو غير مجاني)
-    # تم إزالة شرط is_free_or_negligible
+    # ✅ شرط المجانية - نشتري فقط إذا كان السعر مجاني
+    if not is_free_or_negligible(price_wei, eth_price_usd):
+        log.info(f"⏭️ '{slug}': ليس مجانياً (السعر: {(price_wei/1e18)*eth_price_usd:.4f}$) - تم التخطي")
+        return None
 
     max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
     max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
@@ -337,8 +340,21 @@ async def evaluate_new_mint(slug: str):
         if not stage or not started_today_local(stage):
             return
 
-        # تم إزالة التحقق من تويتر/إكس
-        log.info(f"✅ '{slug}': مينت نشط اليوم — المتابعة للشراء.")
+        # التحقق من السعر أولاً
+        contract_address = detail.get("contract_address")
+        eth_price_usd = get_eth_price_usd()
+        
+        if contract_address:
+            onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, W3_INSTANCE, contract_address)
+            price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
+            
+            # ✅ إذا كان السعر ليس مجانياً، نتجاهل
+            if not is_free_or_negligible(price_wei, eth_price_usd):
+                log.info(f"⏭️ '{slug}': ليس مجانياً (السعر: {(price_wei/1e18)*eth_price_usd:.4f}$) - تم التخطي")
+                mark_rejected(slug)
+                return
+
+        log.info(f"✅ '{slug}': مينت مجاني نشط اليوم — المتابعة للشراء.")
 
         results = await try_buy_now_multi_wallet(slug, detail)
 
@@ -383,6 +399,19 @@ async def watch_loop():
                     watchlist.pop(slug, None)
                     continue
 
+                # التحقق من السعر مرة أخرى في دورة المراقبة
+                contract_address = fresh_detail.get("contract_address")
+                eth_price_usd = get_eth_price_usd()
+                
+                if contract_address:
+                    onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, W3_INSTANCE, contract_address)
+                    price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
+                    
+                    if not is_free_or_negligible(price_wei, eth_price_usd):
+                        log.info(f"⏭️ '{slug}': تغير السعر إلى مدفوع - إزالة من المراقبة")
+                        watchlist.pop(slug, None)
+                        continue
+
                 results = await try_buy_now_multi_wallet(slug, fresh_detail)
 
                 if results is None:
@@ -405,7 +434,7 @@ async def listen_opensea():
     while True:
         try:
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
-                log.info(f"متصل بـ OpenSea Stream — يراقب لـ {len(WALLETS_DATA)} محافظ على شبكة Ink.")
+                log.info(f"متصل بـ OpenSea Stream — يراقب المينتات المجانية على Ink لـ {len(WALLETS_DATA)} محافظ.")
                 join_ref = str(msg_ref)
                 await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                 msg_ref += 1
