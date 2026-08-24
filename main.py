@@ -59,10 +59,10 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
 FREE_PRICE_THRESHOLD_USD = 0.0001
-WATCH_POLL_INTERVAL_SECONDS = 15
-PAID_MINTS_CHECK_INTERVAL = 3  # ✅ تقليل الفاصل الزمني
-DISCOVERED_MINTS_CHECK_INTERVAL = 5  # ✅ فحص دوري للمينتات المكتشفة
-PAID_MINTS_EXPIRY_SECONDS = 1800  # ✅ 30 دقيقة بدلاً من ساعة
+WATCH_POLL_INTERVAL_SECONDS = 5  # ✅ تقليل للفحص الأسرع
+PAID_MINTS_CHECK_INTERVAL = 3
+DISCOVERED_MINTS_CHECK_INTERVAL = 5
+PAID_MINTS_EXPIRY_SECONDS = 1800
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,6 +93,9 @@ rejected_cooldown: dict[str, float] = {}
 
 paid_mints_tracking: dict[str, dict] = {}
 discovered_mints: set[str] = set()
+
+# ✅ إضافة عداد للأحداث المستلمة
+event_counter = defaultdict(int)
 
 # ==================== إعدادات السرعة ====================
 
@@ -126,7 +129,8 @@ bot_stats = {
     "mints_per_chain": defaultdict(int),
     "wallets_used": set(),
     "telegram_messages_sent": 0,
-    "telegram_errors": 0
+    "telegram_errors": 0,
+    "events_received": 0,  # ✅ إضافة
 }
 
 def get_uptime() -> str:
@@ -249,18 +253,13 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
     if current:
         price_wei = int(current.get("price", "0"))
         
-        # ✅ تحقق من نوع المرحلة
         stage_type = current.get("type", "public").lower()
         
-        # ✅ المراحل المؤهلة تلقائياً
         auto_eligible_types = ["public", "free", "open"]
-        
-        # ✅ المراحل التي تحتاج تحقق
         restricted_types = ["allowlist", "whitelist", "team", "presale", "early_access"]
         
         is_eligible = stage_type in auto_eligible_types
         
-        # ✅ إذا كانت المرحلة مجانية، قد تكون مؤهلة حتى لو كانت restricted
         if is_free_or_negligible(price_wei, eth_price_usd):
             is_eligible = True
         
@@ -288,7 +287,6 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
         
         is_eligible = stage_type in auto_eligible_types
         
-        # ✅ المرحلة المجانية القادمة مؤهلة دائماً
         if is_free_or_negligible(price_wei, eth_price_usd):
             is_eligible = True
         
@@ -506,6 +504,8 @@ async def purchase_task_for_wallet(
 
         bot_stats["purchase_attempts"] += 1
         
+        log.info(f"🔫 محاولة شراء للمحفظة {wallet_addr[:8]}... - {slug}")
+        
         res = await asyncio.to_thread(
             attempt_purchase_single_wallet,
             w3, pk, wallet_addr,
@@ -567,6 +567,8 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict, pric
     if not pending_items:
         return [{"success": False, "reason": "all_wallets_completed"}]
 
+    log.info(f"🛒 بدء الشراء لـ {slug} - {len(pending_items)} محافظ متبقية")
+
     for item in pending_items:
         item["current_detail"] = detail
         item["chain_key"] = chain_key
@@ -608,9 +610,6 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                 in_flight.discard(slug)
                 return
 
-            # ✅ تعديل: لا نرفض إذا كان is_minting=False
-            # قد تكون المرحلة العامة نشطة رغم أن is_minting=False
-
             # ✅ تحليل شامل لجميع المراحل
             analysis = analyze_all_stages(slug, detail)
             
@@ -628,8 +627,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                     log.info(f"   📌 {stage['name']} | {status_text} | {price_text} | {eligible_text}")
                 
                 discovered_mints.add(slug)
-
-            bot_stats["mints_detected"] += 1
+                bot_stats["mints_detected"] += 1
 
             # ✅ الحفاظ على شرط Twitter
             twitter_username = get_cached_twitter(slug)
@@ -645,7 +643,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                     log.debug(f"خطأ في جلب تويتر لـ {slug}: {e}")
                     twitter_username = None
             
-            # رفض إذا لم يكن لديه حساب X (الحفاظ على الشرط)
+            # رفض إذا لم يكن لديه حساب X
             if twitter_username is None:
                 log.info(f"❌ '{slug}' مرفوض - لا يوجد حساب X")
                 mark_rejected(slug)
@@ -737,7 +735,7 @@ async def scan_paid_mints():
                     wait_time = time.time() - data.get('first_seen', time.time())
                     log.info(f"🔄 '{slug}' أصبح مجانياً بعد {wait_time:.0f} ثانية!")
                     
-                    # ✅ شراء مباشر بدلاً من إعادة التقييم
+                    # ✅ شراء مباشر
                     chain_key = data.get("chain_key", "ink")
                     
                     # إيجاد المرحلة المجانية النشطة
@@ -753,7 +751,7 @@ async def scan_paid_mints():
                     
                     paid_mints_tracking.pop(slug, None)
                 else:
-                    # ✅ تحديث البيانات حتى لو لم تكن مجانية
+                    # ✅ تحديث البيانات
                     paid_mints_tracking[slug] = {
                         "chain_key": data.get("chain_key", "ink"),
                         "detail": fresh_detail,
@@ -936,89 +934,163 @@ async def listen_opensea_fast():
     msg_ref = 0
     recent_mints = {}
     RECENT_WINDOW = 2
+    reconnect_attempts = 0
     
     while True:
         try:
+            log.info(f"🔄 محاولة الاتصال بـ OpenSea Stream... (محاولة #{reconnect_attempts + 1})")
+            
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
-                log.info(f"🚀 متصل بـ OpenSea Stream — اكتشاف شامل لـ {len(WALLETS_DATA)} محافظ على Ink.")
-                log.info(f"📋 يكتشف جميع المراحل: Team, Allowlist, Public, إلخ")
+                log.info(f"✅ تم الاتصال بـ OpenSea Stream بنجاح!")
+                log.info(f"🚀 اكتشاف شامل لـ {len(WALLETS_DATA)} محافظ على Ink.")
+                
+                # ✅ الاشتراك في جميع المجموعات
                 join_ref = str(msg_ref)
-                await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
+                subscribe_msg = json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}])
+                await ws.send(subscribe_msg)
+                log.info(f"📡 تم الاشتراك في جميع المجموعات")
                 msg_ref += 1
+                
+                # ✅ الاشتراك في الأحداث المحددة
+                for event in ["item_transferred", "item_listed", "collection_created", "item_sold", "item_metadata_updated"]:
+                    event_ref = str(msg_ref)
+                    event_msg = json.dumps([event_ref, event_ref, f"collection:*:{event}", "phx_join", {}])
+                    await ws.send(event_msg)
+                    msg_ref += 1
+                
                 last_heartbeat = time.time()
+                last_event_time = time.time()
+                events_received = 0
 
                 while True:
+                    # ✅ إرسال heartbeat
                     if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
                         hb_ref = str(msg_ref)
                         await ws.send(json.dumps([None, hb_ref, "phoenix", "heartbeat", {}]))
                         msg_ref += 1
                         last_heartbeat = time.time()
+                        
+                        # ✅ تحذير إذا لم تصل أحداث لفترة طويلة
+                        if time.time() - last_event_time > 60:
+                            log.warning(f"⚠️ لم تصل أي أحداث منذ {int(time.time() - last_event_time)} ثانية")
+                            # ✅ إعادة الاتصال إذا لم تصل أحداث
+                            log.info("🔄 إعادة الاتصال بسبب عدم وجود أحداث...")
+                            break
 
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT)
                     except asyncio.TimeoutError:
                         continue
+                    except websockets.ConnectionClosed as e:
+                        log.warning(f"⚠️ تم إغلاق الاتصال: {e}")
+                        break
 
                     try:
                         parsed = json.loads(raw)
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as e:
+                        log.warning(f"⚠️ فشل تحليل JSON: {e}")
                         continue
 
-                    if isinstance(parsed, list) and len(parsed) == 5:
-                        _jref, _ref, _topic, event_name, payload_wrapper = parsed
-                    else:
-                        continue
-
-                    # ✅ قبول جميع أنواع الأحداث
-                    if event_name not in [
-                        "item_transferred", 
-                        "item_listed", 
-                        "collection_created", 
-                        "item_received", 
-                        "item_sold",
-                        "item_metadata_updated",
-                        "collection_updated"
-                    ]:
-                        continue
-
-                    payload = (payload_wrapper or {}).get("payload") or {}
-                    item = payload.get("item", {}) or {}
-                    stream_chain_name = (item.get("chain", {}) or {}).get("name", "")
-
-                    chain_key = STREAM_NAME_TO_CHAIN_KEY.get(stream_chain_name)
-                    if chain_key is None:
-                        continue
-
-                    # فقط Ink
-                    if chain_key != "ink":
-                        continue
-
-                    slug = (payload.get("collection", {}) or {}).get("slug", "")
-                    if not slug:
-                        continue
-
-                    # منع التكرار
-                    now = time.time()
-                    if slug in recent_mints:
-                        if now - recent_mints[slug] < RECENT_WINDOW:
+                    # ✅ تحقق من نوع الرسالة
+                    if isinstance(parsed, list) and len(parsed) >= 4:
+                        _jref, _ref, topic, event_name = parsed[:4]
+                        payload_wrapper = parsed[4] if len(parsed) > 4 else {}
+                        
+                        # ✅ تسجيل جميع الأحداث القادمة
+                        events_received += 1
+                        last_event_time = time.time()
+                        bot_stats["events_received"] += 1
+                        
+                        if events_received <= 10:
+                            log.info(f"📨 حدث #{events_received}: {event_name}")
+                        
+                        # ✅ قبول جميع الأحداث المتعلقة بالمجموعات
+                        accepted_events = [
+                            "item_transferred", 
+                            "item_listed", 
+                            "collection_created", 
+                            "item_received", 
+                            "item_sold",
+                            "item_metadata_updated",
+                            "collection_updated",
+                            "item_cancelled",
+                            "item_offered",
+                            "collection_offer_created"
+                        ]
+                        
+                        if event_name not in accepted_events:
                             continue
-                    recent_mints[slug] = now
 
-                    # تنظيف الذاكرة
-                    for s in list(recent_mints.keys()):
-                        if now - recent_mints[s] > 60:
-                            del recent_mints[s]
+                        # ✅ استخراج البيانات
+                        payload = (payload_wrapper or {}).get("payload") or {}
+                        
+                        # ✅ محاولة استخراج معلومات المجموعة بطرق مختلفة
+                        collection_info = payload.get("collection", {}) or {}
+                        item = payload.get("item", {}) or {}
+                        
+                        slug = collection_info.get("slug", "")
+                        
+                        # ✅ إذا لم نجد slug في collection، نحاول من item
+                        if not slug:
+                            collection_from_item = item.get("collection", {}) or {}
+                            slug = collection_from_item.get("slug", "")
+                        
+                        if not slug:
+                            continue
+                        
+                        # ✅ استخراج اسم السلسلة
+                        stream_chain_name = ""
+                        chain_info = item.get("chain", {}) or {}
+                        stream_chain_name = chain_info.get("name", "")
+                        
+                        # ✅ إذا لم نجد السلسلة في item، نحاول من collection
+                        if not stream_chain_name:
+                            chain_info = collection_info.get("chain", {}) or {}
+                            stream_chain_name = chain_info.get("name", "")
+                        
+                        chain_key = STREAM_NAME_TO_CHAIN_KEY.get(stream_chain_name)
+                        
+                        if chain_key is None:
+                            continue
+                        
+                        # فقط Ink
+                        if chain_key != "ink":
+                            continue
 
-                    log.info(f"📨 حدث: {event_name} → {slug}")
-                    asyncio.create_task(evaluate_new_mint_fast(slug, chain_key))
+                        # ✅ تسجيل اكتشاف مينت جديد
+                        log.info(f"🎯 اكتشاف مينت على Ink: {slug} (حدث: {event_name})")
+                        
+                        # منع التكرار
+                        now = time.time()
+                        if slug in recent_mints:
+                            if now - recent_mints[slug] < RECENT_WINDOW:
+                                continue
+                        recent_mints[slug] = now
+
+                        # تنظيف الذاكرة
+                        for s in list(recent_mints.keys()):
+                            if now - recent_mints[s] > 60:
+                                del recent_mints[s]
+
+                        log.info(f"📨 معالجة حدث: {event_name} → {slug} على {chain_key}")
+                        asyncio.create_task(evaluate_new_mint_fast(slug, chain_key))
+                    
+                    elif isinstance(parsed, dict):
+                        # ✅ رسائل التحكم
+                        if events_received <= 3:
+                            log.info(f"📨 رسالة تحكم: {parsed.get('event', 'unknown')}")
 
         except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-            log.warning(f"⚠️ انقطع الاتصال ({e}). إعادة الاتصال خلال 2 ثانية...")
+            reconnect_attempts += 1
+            log.warning(f"⚠️ انقطع الاتصال ({e}). إعادة الاتصال خلال 2 ثانية... (محاولة #{reconnect_attempts})")
             await asyncio.sleep(2)
         except Exception as e:
+            reconnect_attempts += 1
             log.error(f"❌ خطأ غير متوقع: {e}")
             bot_stats["errors"] += 1
             await asyncio.sleep(3)
+        else:
+            reconnect_attempts = 0
 
 # ==================== التشغيل الرئيسي ====================
 
@@ -1038,7 +1110,7 @@ async def run():
     await asyncio.gather(
         listen_opensea_fast(),
         scan_paid_mints(),
-        check_all_discovered_mints(),  # ✅ إضافة الفحص الدوري
+        check_all_discovered_mints(),
         watch_loop(),
         telegram_sender()
     )
@@ -1049,7 +1121,7 @@ def main():
         try:
             asyncio.run(run())
         except KeyboardInterrupt:
-            log.info("تم الإيقاف يدويًا.")
+            log.info("تم الإيقاف يدوياً.")
             break
         except Exception as e:
             log.critical(f"توقف غير متوقع: {e}.")
