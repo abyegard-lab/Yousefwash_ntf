@@ -60,6 +60,9 @@ HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
 FREE_PRICE_THRESHOLD_USD = 0.0001
 WATCH_POLL_INTERVAL_SECONDS = 15
+PAID_MINTS_CHECK_INTERVAL = 3  # ✅ تقليل الفاصل الزمني
+DISCOVERED_MINTS_CHECK_INTERVAL = 5  # ✅ فحص دوري للمينتات المكتشفة
+PAID_MINTS_EXPIRY_SECONDS = 1800  # ✅ 30 دقيقة بدلاً من ساعة
 
 logging.basicConfig(
     level=logging.INFO,
@@ -235,7 +238,7 @@ def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
 
 def analyze_all_stages(slug: str, detail: dict) -> dict:
     """
-    تحليل شامل لجميع المراحل: Team, Allowlist, Public, إلخ
+    تحليل شامل لجميع المراحل مع التحقق من الأهلية
     """
     eth_price_usd = get_eth_price_usd()
     
@@ -245,8 +248,24 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
     current = detail.get("active_stage")
     if current:
         price_wei = int(current.get("price", "0"))
+        
+        # ✅ تحقق من نوع المرحلة
+        stage_type = current.get("type", "public").lower()
+        
+        # ✅ المراحل المؤهلة تلقائياً
+        auto_eligible_types = ["public", "free", "open"]
+        
+        # ✅ المراحل التي تحتاج تحقق
+        restricted_types = ["allowlist", "whitelist", "team", "presale", "early_access"]
+        
+        is_eligible = stage_type in auto_eligible_types
+        
+        # ✅ إذا كانت المرحلة مجانية، قد تكون مؤهلة حتى لو كانت restricted
+        if is_free_or_negligible(price_wei, eth_price_usd):
+            is_eligible = True
+        
         all_stages.append({
-            "name": current.get("type", "public"),
+            "name": stage_type,
             "price_wei": price_wei,
             "price_usd": (price_wei / 1e18) * eth_price_usd,
             "is_free": is_free_or_negligible(price_wei, eth_price_usd),
@@ -254,15 +273,27 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
             "end_time": current.get("end_time"),
             "max_per_wallet": current.get("max_per_wallet"),
             "status": "active",
-            "is_eligible": True  # نفترض أن المستخدم مؤهل
+            "is_eligible": is_eligible,
+            "requires_verification": stage_type in restricted_types
         })
     
     # 2. المراحل القادمة (next_stages)
     next_stages = detail.get("next_stages", [])
     for stage in next_stages:
         price_wei = int(stage.get("price", "0"))
+        stage_type = stage.get("type", "unknown").lower()
+        
+        auto_eligible_types = ["public", "free", "open"]
+        restricted_types = ["allowlist", "whitelist", "team", "presale", "early_access"]
+        
+        is_eligible = stage_type in auto_eligible_types
+        
+        # ✅ المرحلة المجانية القادمة مؤهلة دائماً
+        if is_free_or_negligible(price_wei, eth_price_usd):
+            is_eligible = True
+        
         all_stages.append({
-            "name": stage.get("type", "unknown"),
+            "name": stage_type,
             "price_wei": price_wei,
             "price_usd": (price_wei / 1e18) * eth_price_usd,
             "is_free": is_free_or_negligible(price_wei, eth_price_usd),
@@ -270,10 +301,11 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
             "end_time": stage.get("end_time"),
             "max_per_wallet": stage.get("max_per_wallet"),
             "status": "upcoming",
-            "is_eligible": True
+            "is_eligible": is_eligible,
+            "requires_verification": stage_type in restricted_types
         })
     
-    # 3. المراحل السابقة (past_stages) - للتوثيق فقط
+    # 3. المراحل السابقة (past_stages)
     past_stages = detail.get("past_stages", [])
     for stage in past_stages:
         price_wei = int(stage.get("price", "0"))
@@ -286,7 +318,8 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
             "end_time": stage.get("end_time"),
             "max_per_wallet": stage.get("max_per_wallet"),
             "status": "past",
-            "is_eligible": False
+            "is_eligible": False,
+            "requires_verification": False
         })
     
     # 4. البحث عن مراحل مجانية (حالية أو قادمة)
@@ -296,21 +329,27 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
     for stage in all_stages:
         if stage["status"] == "past":
             continue
-        if stage["is_free"]:
+        if stage["is_free"] and stage["is_eligible"]:
             free_stages.append(stage)
         else:
             paid_stages.append(stage)
     
     # 5. هل يوجد مرحلة مجانية حالياً؟
-    has_free_active = any(s["is_free"] and s["status"] == "active" for s in all_stages)
+    has_free_active = any(
+        s["is_free"] and s["status"] == "active" and s["is_eligible"] 
+        for s in all_stages
+    )
     
     # 6. هل توجد مرحلة مجانية قادمة؟
-    has_free_upcoming = any(s["is_free"] and s["status"] == "upcoming" for s in all_stages)
+    has_free_upcoming = any(
+        s["is_free"] and s["status"] == "upcoming" and s["is_eligible"] 
+        for s in all_stages
+    )
     
     # 7. المرحلة المجانية التالية
     next_free_stage = None
     for stage in all_stages:
-        if stage["is_free"] and stage["status"] != "past":
+        if stage["is_free"] and stage["status"] != "past" and stage["is_eligible"]:
             if stage["status"] == "active":
                 next_free_stage = stage
                 break
@@ -569,10 +608,8 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                 in_flight.discard(slug)
                 return
 
-            if not detail.get("is_minting"):
-                log.info(f"⏸️ {slug} ليس في حالة minting")
-                in_flight.discard(slug)
-                return
+            # ✅ تعديل: لا نرفض إذا كان is_minting=False
+            # قد تكون المرحلة العامة نشطة رغم أن is_minting=False
 
             # ✅ تحليل شامل لجميع المراحل
             analysis = analyze_all_stages(slug, detail)
@@ -587,13 +624,14 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                         continue
                     status_text = "🟢 نشطة" if stage['status'] == 'active' else "⏳ قادمة"
                     price_text = "مجاني" if stage['is_free'] else f"${stage['price_usd']:.4f}"
-                    log.info(f"   📌 {stage['name']} | {status_text} | {price_text}")
+                    eligible_text = "✅ مؤهل" if stage.get('is_eligible', True) else "❌ غير مؤهل"
+                    log.info(f"   📌 {stage['name']} | {status_text} | {price_text} | {eligible_text}")
                 
                 discovered_mints.add(slug)
 
             bot_stats["mints_detected"] += 1
 
-            # ✅ التحقق من وجود حساب X
+            # ✅ الحفاظ على شرط Twitter
             twitter_username = get_cached_twitter(slug)
             if twitter_username is None:
                 try:
@@ -607,7 +645,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                     log.debug(f"خطأ في جلب تويتر لـ {slug}: {e}")
                     twitter_username = None
             
-            # رفض إذا لم يكن لديه حساب X
+            # رفض إذا لم يكن لديه حساب X (الحفاظ على الشرط)
             if twitter_username is None:
                 log.info(f"❌ '{slug}' مرفوض - لا يوجد حساب X")
                 mark_rejected(slug)
@@ -622,7 +660,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                 
                 # إيجاد المرحلة المجانية النشطة
                 for stage in analysis['all_stages']:
-                    if stage['is_free'] and stage['status'] == 'active':
+                    if stage['is_free'] and stage['status'] == 'active' and stage.get('is_eligible', True):
                         results = await try_buy_now_multi_wallet(
                             slug, chain_key, detail, stage['price_wei']
                         )
@@ -648,10 +686,18 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                         "next_free_stage": next_free
                     }
             
-            # ✅ لا توجد مرحلة مجانية → تجاهل
+            # ✅ لا توجد مرحلة مجانية → تتبع للمستقبل
             else:
-                log.info(f"💰 '{slug}' لا توجد مرحلة مجانية - تم تجاهله")
-                mark_rejected(slug)
+                log.info(f"💰 '{slug}' لا توجد مرحلة مجانية حالياً - جارٍ التتبع للمستقبل")
+                paid_mints_tracking[slug] = {
+                    "chain_key": chain_key,
+                    "detail": detail,
+                    "first_seen": time.time(),
+                    "last_check": time.time(),
+                    "check_count": 0,
+                    "analysis": analysis,
+                    "next_free_stage": None
+                }
 
         except Exception as e:
             log.error(f"خطأ بتقييم '{slug}': {e}")
@@ -666,7 +712,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
 async def scan_paid_mints():
     while True:
         try:
-            await asyncio.sleep(10)
+            await asyncio.sleep(PAID_MINTS_CHECK_INTERVAL)
             
             if not paid_mints_tracking:
                 continue
@@ -680,8 +726,7 @@ async def scan_paid_mints():
                     continue
                 
                 found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
-                if not found or not fresh_detail or not fresh_detail.get("is_minting"):
-                    paid_mints_tracking.pop(slug, None)
+                if not found:
                     continue
                 
                 # ✅ تحليل شامل للمراحل
@@ -691,9 +736,24 @@ async def scan_paid_mints():
                 if analysis['has_free_active']:
                     wait_time = time.time() - data.get('first_seen', time.time())
                     log.info(f"🔄 '{slug}' أصبح مجانياً بعد {wait_time:.0f} ثانية!")
+                    
+                    # ✅ شراء مباشر بدلاً من إعادة التقييم
+                    chain_key = data.get("chain_key", "ink")
+                    
+                    # إيجاد المرحلة المجانية النشطة
+                    for stage in analysis['all_stages']:
+                        if stage['is_free'] and stage['status'] == 'active' and stage.get('is_eligible', True):
+                            results = await try_buy_now_multi_wallet(
+                                slug, chain_key, fresh_detail, stage['price_wei']
+                            )
+                            break
+                    
+                    if results and len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
+                        watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
+                    
                     paid_mints_tracking.pop(slug, None)
-                    asyncio.create_task(evaluate_new_mint_fast(slug, data['chain_key']))
                 else:
+                    # ✅ تحديث البيانات حتى لو لم تكن مجانية
                     paid_mints_tracking[slug] = {
                         "chain_key": data.get("chain_key", "ink"),
                         "detail": fresh_detail,
@@ -704,11 +764,11 @@ async def scan_paid_mints():
                         "next_free_stage": analysis.get('next_free_stage')
                     }
             
-            # إزالة المينتات القديمة
+            # ✅ إزالة المينتات القديمة
             now = time.time()
             expired = []
             for slug, data in paid_mints_tracking.items():
-                if now - data.get('first_seen', now) > 3600:
+                if now - data.get('first_seen', now) > PAID_MINTS_EXPIRY_SECONDS:
                     expired.append(slug)
             
             for slug in expired:
@@ -718,7 +778,92 @@ async def scan_paid_mints():
         except Exception as e:
             log.error(f"خطأ في فحص المينتات المدفوعة: {e}")
             bot_stats["errors"] += 1
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
+
+# ---------------------------------------------------------------------------
+# الفحص الدوري للمينتات المكتشفة
+# ---------------------------------------------------------------------------
+
+async def check_all_discovered_mints():
+    """فحص دوري لجميع المينتات المكتشفة للتأكد من عدم تفويت أي فرصة"""
+    while True:
+        try:
+            await asyncio.sleep(DISCOVERED_MINTS_CHECK_INTERVAL)
+            
+            if not discovered_mints:
+                continue
+            
+            for slug in list(discovered_mints):
+                # تجاهل المينتات التي اكتمل شراؤها
+                if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
+                    continue
+                
+                # تجاهل المينتات المرفوضة مؤخراً
+                if is_in_cooldown(slug):
+                    continue
+                
+                # تجاهل المينتات قيد المعالجة
+                if slug in in_flight:
+                    continue
+                
+                found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
+                if not found or not detail:
+                    continue
+                
+                analysis = analyze_all_stages(slug, detail)
+                
+                # ✅ إذا أصبحت المرحلة المجانية نشطة
+                if analysis['has_free_active']:
+                    log.info(f"🟢 '{slug}' لديه مرحلة مجانية نشطة الآن!")
+                    
+                    chain_key = "ink"
+                    
+                    # الحفاظ على شرط Twitter
+                    twitter_username = get_cached_twitter(slug)
+                    if twitter_username is None:
+                        try:
+                            twitter_username = await asyncio.to_thread(
+                                get_twitter_username_from_opensea, 
+                                slug, 
+                                OPENSEA_API_KEY
+                            )
+                            set_cached_twitter(slug, twitter_username)
+                        except Exception as e:
+                            log.debug(f"خطأ في جلب تويتر لـ {slug}: {e}")
+                            twitter_username = None
+                    
+                    if twitter_username is None:
+                        log.info(f"❌ '{slug}' لا يوجد حساب X - تخطي")
+                        mark_rejected(slug)
+                        continue
+                    
+                    # إيجاد المرحلة المجانية النشطة
+                    for stage in analysis['all_stages']:
+                        if stage['is_free'] and stage['status'] == 'active' and stage.get('is_eligible', True):
+                            results = await try_buy_now_multi_wallet(
+                                slug, chain_key, detail, stage['price_wei']
+                            )
+                            break
+                    
+                    if results and len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
+                        watchlist[slug] = {"chain_key": chain_key, "detail": detail}
+                
+                # ✅ إذا كانت هناك مرحلة مجانية قادمة
+                elif analysis['has_free_upcoming']:
+                    paid_mints_tracking[slug] = {
+                        "chain_key": "ink",
+                        "detail": detail,
+                        "first_seen": time.time(),
+                        "last_check": time.time(),
+                        "check_count": 0,
+                        "analysis": analysis,
+                        "next_free_stage": analysis['next_free_stage']
+                    }
+                        
+        except Exception as e:
+            log.error(f"خطأ في الفحص الدوري: {e}")
+            bot_stats["errors"] += 1
+            await asyncio.sleep(2)
 
 # ---------------------------------------------------------------------------
 # watch_loop
@@ -744,7 +889,7 @@ async def watch_loop():
                 chain_key = entry["chain_key"]
                 found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
 
-                if not found or not fresh_detail or not fresh_detail.get("is_minting"):
+                if not found or not fresh_detail:
                     watchlist.pop(slug, None)
                     continue
 
@@ -752,6 +897,17 @@ async def watch_loop():
                 analysis = analyze_all_stages(slug, fresh_detail)
                 
                 if not analysis['has_free_active']:
+                    # ✅ إذا لم تعد مجانية، أضف للتتبع
+                    if analysis['has_free_upcoming']:
+                        paid_mints_tracking[slug] = {
+                            "chain_key": chain_key,
+                            "detail": fresh_detail,
+                            "first_seen": time.time(),
+                            "last_check": time.time(),
+                            "check_count": 0,
+                            "analysis": analysis,
+                            "next_free_stage": analysis['next_free_stage']
+                        }
                     watchlist.pop(slug, None)
                     continue
 
@@ -882,6 +1038,7 @@ async def run():
     await asyncio.gather(
         listen_opensea_fast(),
         scan_paid_mints(),
+        check_all_discovered_mints(),  # ✅ إضافة الفحص الدوري
         watch_loop(),
         telegram_sender()
     )
