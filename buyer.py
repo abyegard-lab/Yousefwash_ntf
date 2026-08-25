@@ -111,12 +111,19 @@ def get_fee_recipient(w3: Web3, nft_contract: str, drop: dict) -> Optional[str]:
 
 def estimate_fee_usd(w3: Web3, tx: dict, eth_price_usd: float) -> tuple[float, int]:
     """تقدير رسوم الغاز بالدولار"""
-    gas = int(w3.eth.estimate_gas(tx))
+    try:
+        gas = int(w3.eth.estimate_gas(tx))
+    except Exception:
+        gas = 21000  # قيمة افتراضية
+    
     try:
         gas_price = int(w3.eth.gas_price)
     except Exception:
         gas_price = int(tx.get("gasPrice", 0))
-    return gas * gas_price / 1e18 * eth_price_usd, gas
+    
+    fee_eth = gas * gas_price / 1e18
+    fee_usd = fee_eth * eth_price_usd
+    return fee_usd, gas
 
 def attempt_purchase(
     w3: Web3,
@@ -148,7 +155,11 @@ def attempt_purchase(
     """
     wallet = Web3.to_checksum_address(wallet)
     nft_contract = Web3.to_checksum_address(nft_contract)
-    drop = get_public_drop(w3, nft_contract)
+    
+    try:
+        drop = get_public_drop(w3, nft_contract)
+    except Exception as e:
+        return MintResult(False, wallet, reason=f"drop_fetch_failed: {str(e)[:100]}").__dict__
 
     now = int(time.time())
     
@@ -164,12 +175,22 @@ def attempt_purchase(
 
     # اختيار الكمية
     quantity = choose_quantity(drop, remaining_supply, max_qty)
-    fee_recipient = get_fee_recipient(w3, nft_contract, drop)
+    
+    # الحصول على مستلم الرسوم
+    try:
+        fee_recipient = get_fee_recipient(w3, nft_contract, drop)
+    except Exception as e:
+        return MintResult(False, wallet, quantity, reason=f"fee_recipient_failed: {str(e)[:100]}").__dict__
 
     contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=ABI)
     total_value = int(drop["mintPrice"]) * quantity
 
-    nonce = int(w3.eth.get_transaction_count(wallet, "pending"))
+    # الحصول على nonce
+    try:
+        nonce = int(w3.eth.get_transaction_count(wallet, "pending"))
+    except Exception as e:
+        return MintResult(False, wallet, quantity, reason=f"nonce_failed: {str(e)[:100]}").__dict__
+
     tx_base = {
         "from": wallet,
         "value": total_value,
@@ -188,32 +209,50 @@ def attempt_purchase(
         return MintResult(False, wallet, quantity, reason=f"simulation_failed: {str(e)[:100]}").__dict__
 
     # تقدير رسوم الغاز
-    gas_fee_usd, gas = estimate_fee_usd(w3, tx_base, eth_price_usd)
+    try:
+        gas_fee_usd, gas = estimate_fee_usd(w3, tx_base, eth_price_usd)
+    except Exception as e:
+        return MintResult(False, wallet, quantity, reason=f"gas_estimate_failed: {str(e)[:100]}").__dict__
+    
     if gas_fee_usd > max_gas_fee_usd:
         return MintResult(False, wallet, quantity, reason="gas_too_high",
                           gas_fee_usd=gas_fee_usd).__dict__
 
     # بناء المعاملة
-    tx = contract.functions.mintPublic(*call_args).build_transaction(tx_base)
+    try:
+        tx = contract.functions.mintPublic(*call_args).build_transaction(tx_base)
+    except Exception as e:
+        return MintResult(False, wallet, quantity, reason=f"build_tx_failed: {str(e)[:100]}").__dict__
+    
     tx["gas"] = max(21000, int(gas * 1.05))
+    
     try:
         tx["gasPrice"] = int(w3.eth.gas_price)
     except Exception:
         pass
 
     # التحقق من الرصيد
-    balance = int(w3.eth.get_balance(wallet))
+    try:
+        balance = int(w3.eth.get_balance(wallet))
+    except Exception as e:
+        return MintResult(False, wallet, quantity, reason=f"balance_check_failed: {str(e)[:100]}").__dict__
+    
     max_cost = int(tx.get("value", 0)) + int(tx["gas"]) * int(tx.get("gasPrice", 0))
     if balance < max_cost:
         return MintResult(False, wallet, quantity, reason="insufficient_balance",
                           gas_fee_usd=gas_fee_usd).__dict__
 
     # توقيع وإرسال المعاملة
-    signed = w3.eth.account.sign_transaction(tx, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    h = tx_hash.hex()
+    try:
+        signed = w3.eth.account.sign_transaction(tx, private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        h = tx_hash.hex()
+    except Exception as e:
+        return MintResult(False, wallet, quantity, reason=f"send_tx_failed: {str(e)[:100]}").__dict__
+
     log.info(f"🚀 sent ONE tx | wallet={wallet[:10]} | quantity={quantity} | tx={h[:20]}...")
 
+    # انتظار تأكيد المعاملة
     try:
         receipt = w3.eth.wait_for_transaction_receipt(h, timeout=90, poll_latency=1)
     except Exception as e:
@@ -222,7 +261,11 @@ def attempt_purchase(
 
     if int(receipt.status) == 1:
         gas_used = int(receipt.gasUsed)
-        actual_fee = gas_used * int(tx.get("gasPrice", w3.eth.gas_price)) / 1e18 * eth_price_usd
+        try:
+            gas_price = int(tx.get("gasPrice", w3.eth.gas_price))
+        except Exception:
+            gas_price = 0
+        actual_fee = gas_used * gas_price / 1e18 * eth_price_usd
         return MintResult(True, wallet, quantity, h, actual_fee, "success").__dict__
 
     return MintResult(False, wallet, quantity, h, gas_fee_usd,
