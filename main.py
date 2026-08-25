@@ -38,11 +38,12 @@ if not (len(PRIVATE_KEYS) == len(WALLETS) == len(TELEGRAM_BOT_TOKENS) == len(TEL
 INK_RPC_URL = os.environ.get("INK_RPC_URL", "https://rpc-gel.inkonchain.com/")
 MAX_GAS_FEE_USD = float(os.environ.get("MAX_GAS_FEE_USD", "0.05"))
 MAX_BUY_QTY = min(20, max(1, int(os.environ.get("MAX_BUY_QTY", "20"))))
+ETH_PRICE_USD = float(os.environ.get("ETH_PRICE_USD", "3000"))
 MAX_PARALLEL_DISCOVERY = int(os.environ.get("MAX_PARALLEL_DISCOVERY", "8"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "2"))
 DROP_CACHE_SECONDS = 0.75
-X_RETRY_SECONDS = 60
-X_NEGATIVE_RETRY_SECONDS = 300
+X_LOG_COOLDOWN_SECONDS = 600
+X_RETRY_SECONDS = 30
 DB_PATH = os.environ.get("STATE_DB", "nft_bot.sqlite3")
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
@@ -60,6 +61,7 @@ _inflight = set()
 _watchlist = {}
 _recent_events = {}
 _x_retry = {}
+_x_last_log = {}
 _send_queue = asyncio.Queue()
 
 stats = defaultdict(int)
@@ -149,18 +151,13 @@ async def telegram_sender():
             _send_queue.task_done()
 
 async def validate_x(slug):
-    """OpenSea-only X check. Temporary OpenSea errors are retryable.
-
-    Returns (status, username): status is True when an X account is present,
-    False when OpenSea explicitly has no username, and None for temporary
-    OpenSea failures such as 429/timeouts.
-    """
+    """OpenSea-only X check. 429/timeouts are temporary, never negative."""
     username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
+    status = get_last_lookup_status(slug)
     if username and is_valid_twitter_account(username):
         return True, username
-    # twitter_checker deliberately does not cache temporary failures.
-    # We cannot distinguish them from a negative value here, so evaluate()
-    # will retry the slug rather than permanently rejecting it.
+    if status == "temporary":
+        return None, None
     return False, None
 
 
@@ -173,7 +170,7 @@ async def buy_for_wallet(slug, detail, wallet_item, phase):
         result = await asyncio.to_thread(
             attempt_purchase_single_wallet, W3, wallet_item["private_key"], wallet,
             get_contract(detail), 0, phase["maxTotalMintableByWallet"], remaining_supply(detail),
-            3000.0, MAX_GAS_FEE_USD, MAX_BUY_QTY
+            ETH_PRICE_USD, MAX_GAS_FEE_USD, MAX_BUY_QTY
         )
         if result.get("success"):
             save_purchase(slug, wallet, result["tx_hash"], "success", result.get("quantity", 0)); stats["mints_purchased"] += result.get("quantity", 0)
@@ -207,18 +204,25 @@ async def evaluate(slug):
             retry_at = _x_retry.get(slug, 0)
             if retry_at and time.time() < retry_at:
                 return
-            username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
+            x_ok, username = await validate_x(slug)
             x_status = get_last_lookup_status(slug)
-            if not username:
-                if x_status == "temporary":
-                    _x_retry[slug] = time.time() + X_RETRY_SECONDS
+            now = time.time()
+            if x_ok is None:
+                retry_at = now + X_RETRY_SECONDS
+                _x_retry[slug] = max(_x_retry.get(slug, 0), retry_at)
+                if now - _x_last_log.get(slug, 0) >= 30:
                     log.warning("⏳ %s: OpenSea X lookup temporary failure; will retry", slug)
-                else:
-                    _x_retry.pop(slug, None)
+                    _x_last_log[slug] = now
+                return
+            if not x_ok:
+                _x_retry.pop(slug, None)
+                # Do not spam logs when Stream emits repeated events.
+                if now - _x_last_log.get(slug, 0) >= X_LOG_COOLDOWN_SECONDS:
                     log.info("❌ %s: no X account listed by OpenSea", slug)
+                    _x_last_log[slug] = now
                 return
             _x_retry.pop(slug, None)
-            _x_retry.pop(slug, None)
+            _x_last_log.pop(slug, None)
             stage, free = free_stage_active(detail)
             if free:
                 await attempt_mint(slug, detail)
@@ -237,7 +241,8 @@ async def watch_loop():
             found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
             if not found or not detail: continue
             _watchlist[slug] = detail
-            await evaluate(slug)
+            if _x_retry.get(slug, 0) <= time.time():
+                await evaluate(slug)
 
 async def listen_opensea():
     ref = 0
