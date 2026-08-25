@@ -60,10 +60,10 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-FREE_PRICE_THRESHOLD_USD = 0.0001  # ✅ زيادة العتبة
-WATCH_POLL_INTERVAL_SECONDS = 1  # ✅ من 5 إلى 1
-PAID_MINTS_CHECK_INTERVAL = 1  # ✅ من 3 إلى 1
-DISCOVERED_MINTS_CHECK_INTERVAL = 2  # ✅ من 5 إلى 2
+FREE_PRICE_THRESHOLD_USD = 0.01
+WATCH_POLL_INTERVAL_SECONDS = 1
+PAID_MINTS_CHECK_INTERVAL = 1
+DISCOVERED_MINTS_CHECK_INTERVAL = 2
 PAID_MINTS_EXPIRY_SECONDS = 1800
 
 logging.basicConfig(
@@ -100,7 +100,7 @@ event_counter = defaultdict(int)
 
 # ==================== إعدادات السرعة ====================
 
-DROP_CACHE_DURATION = 3  # ✅ من 5 إلى 3
+DROP_CACHE_DURATION = 3
 TWITTER_CACHE_DURATION = 600
 MAX_PARALLEL_TASKS = 10
 
@@ -255,7 +255,10 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
     # 1. المرحلة الحالية (active_stage)
     current = detail.get("active_stage")
     if current:
-        price_wei = int(current.get("price", "0"))
+        try:
+            price_wei = int(current.get("price", "0"))
+        except (ValueError, TypeError):
+            price_wei = 0
         
         stage_type = current.get("type", "public").lower()
         
@@ -283,7 +286,11 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
     # 2. المراحل القادمة (next_stages)
     next_stages = detail.get("next_stages", [])
     for stage in next_stages:
-        price_wei = int(stage.get("price", "0"))
+        try:
+            price_wei = int(stage.get("price", "0"))
+        except (ValueError, TypeError):
+            price_wei = 0
+        
         stage_type = stage.get("type", "unknown").lower()
         
         auto_eligible_types = ["public", "free", "open"]
@@ -302,13 +309,13 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
                 start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
                 time_until_start = (start_dt - datetime.now(timezone.utc)).total_seconds()
                 time_until_start = max(0, time_until_start)
-            except:
+            except (ValueError, TypeError):
                 pass
         
         # تحديد الحالة
         status = "upcoming"
         if time_until_start < 5:
-            status = "imminent"  # ✅ مرحلة وشك
+            status = "imminent"
         elif time_until_start <= 0:
             status = "active"
         
@@ -329,7 +336,10 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
     # 3. المراحل السابقة (past_stages)
     past_stages = detail.get("past_stages", [])
     for stage in past_stages:
-        price_wei = int(stage.get("price", "0"))
+        try:
+            price_wei = int(stage.get("price", "0"))
+        except (ValueError, TypeError):
+            price_wei = 0
         all_stages.append({
             "name": stage.get("type", "unknown"),
             "price_wei": price_wei,
@@ -406,7 +416,7 @@ def get_free_stage_from_detail(detail: dict) -> dict:
     if current:
         try:
             price_wei = int(current.get("price", "0"))
-        except:
+        except (ValueError, TypeError):
             price_wei = 0
         
         # التحقق من السعر على السلسلة
@@ -418,7 +428,7 @@ def get_free_stage_from_detail(detail: dict) -> dict:
                     onchain_price = get_onchain_public_price_wei(w3, contract_address)
                     if onchain_price is not None:
                         price_wei = onchain_price
-                except:
+                except Exception:
                     pass
         
         if is_free_or_negligible(price_wei, eth_price_usd):
@@ -430,15 +440,13 @@ def get_free_stage_from_detail(detail: dict) -> dict:
                     "status": "active",
                     "stage": current
                 }
-        except:
-            pass
     
     # 2. فحص المراحل القادمة (للمراحل التي ستبدأ قريباً)
     next_stages = detail.get("next_stages", [])
     for stage in next_stages:
         try:
             price_wei = int(stage.get("price", "0"))
-        except:
+        except (ValueError, TypeError):
             price_wei = 0
         
         if is_free_or_negligible(price_wei, eth_price_usd):
@@ -457,16 +465,14 @@ def get_free_stage_from_detail(detail: dict) -> dict:
                                 "stage": stage,
                                 "time_until": time_until
                             }
-                    except:
+                    except (ValueError, TypeError):
                         pass
-        except:
-            pass
     
     return None
 
 # ==================== رسائل التيليجرام ====================
 
-send_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+send_queue = asyncio.Queue()
 
 def enqueue_message(bot_token: str, chat_id: str, text: str):
     send_queue.put_nowait({
@@ -1045,7 +1051,7 @@ async def watch_loop():
 async def listen_opensea_fast():
     msg_ref = 0
     recent_mints = {}
-    RECENT_WINDOW = 1  # ✅ تقليل إلى 1 ثانية
+    RECENT_WINDOW = 1
     reconnect_attempts = 0
     
     while True:
