@@ -60,7 +60,7 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-FREE_PRICE_THRESHOLD_USD = 0.01  # ✅ زيادة العتبة
+FREE_PRICE_THRESHOLD_USD = 0.0001  # ✅ زيادة العتبة
 WATCH_POLL_INTERVAL_SECONDS = 1  # ✅ من 5 إلى 1
 PAID_MINTS_CHECK_INTERVAL = 1  # ✅ من 3 إلى 1
 DISCOVERED_MINTS_CHECK_INTERVAL = 2  # ✅ من 5 إلى 2
