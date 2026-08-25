@@ -23,17 +23,14 @@ def get_twitter_username_from_opensea(slug: str, opensea_api_key: str):
             _twitter_cache[slug] = (username, time.time())
             return username
         else:
-            log.warning(f"[OpenSea Collections API] HTTP {resp.status_code} عند جلب '{slug}': {resp.text[:200]}")
+            log.warning(f"[OpenSea] HTTP {resp.status_code} عند جلب '{slug}'")
     except Exception as e:
-        log.warning(f"[Twitter Check] تعذر جلب معلومات المجموعة لـ {slug}: {e}")
+        log.warning(f"[Twitter] تعذر جلب معلومات {slug}: {e}")
     return None
 
 def is_valid_twitter_account(username: str) -> bool:
     bearer_token = os.environ.get("TWITTER_BEARER_TOKEN")
-    if not username:
-        return False
-    if not bearer_token:
-        log.error("[X API] TWITTER_BEARER_TOKEN غير مضبوط في متغيرات البيئة")
+    if not username or not bearer_token:
         return False
 
     try:
@@ -44,28 +41,19 @@ def is_valid_twitter_account(username: str) -> bool:
         if resp.status_code == 200:
             user_data = resp.json().get("data", {})
             metrics = user_data.get("public_metrics", {})
-
             is_verified = user_data.get("verified", False)
             followers_count = metrics.get("followers_count", 0)
 
             if is_verified or followers_count >= 100:
-                log.info(f"✅ حساب X موثوق: @{username} (متابعين: {followers_count})")
+                log.info(f"✅ حساب X موثوق: @{username}")
                 return True
             else:
-                log.info(f"⚠️ حساب X ضعيف: @{username} (متابعين: {followers_count})")
+                log.info(f"⚠️ حساب X ضعيف: @{username}")
                 return False
-
-        elif resp.status_code == 429:
-            log.error(f"[X API] تجاوزت حد الطلبات (429) عند فحص @{username}")
-            return False
-        elif resp.status_code in (401, 403):
-            log.error(f"[X API] فشل مصادقة (HTTP {resp.status_code}) عند فحص @{username}")
-            return False
         else:
-            log.error(f"[X API] استجابة غير متوقعة (HTTP {resp.status_code}) عند فحص @{username}")
+            log.error(f"[X API] HTTP {resp.status_code} عند فحص @{username}")
             return False
 
     except Exception as e:
-        log.error(f"[X API Error] خطأ أثناء التحقق من @{username}: {e}")
-
-    return False
+        log.error(f"[X API] خطأ: {e}")
+        return False
