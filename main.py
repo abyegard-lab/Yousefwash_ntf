@@ -1,4 +1,4 @@
-# main.py - النسخة النهائية المُصححة
+# main.py - النسخة المُصححة
 """
 النظام الكامل — اكتشاف شامل لجميع المينتات بجميع مراحلها
 """
@@ -24,19 +24,22 @@ from buyer import (
     clear_prepared_transactions,
     get_onchain_public_price_wei,
     get_wallet_lock,
-    is_free_or_negligible,  # ✅ استيراد صحيح
+    is_free_or_negligible,
 )
 from twitter_checker import get_twitter_username_from_opensea
 
 load_dotenv()
 
-OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
+OPENSEA_API_KEY = os.environ.get("OPENSEA_API_KEY", "")
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
 
 PRIVATE_KEYS = [k.strip() for k in os.environ.get("PRIVATE_KEYS", "").split(",") if k.strip()]
 WALLETS = [w.strip() for w in os.environ.get("WALLETS", "").split(",") if w.strip()]
 TELEGRAM_BOT_TOKENS = [t.strip() for t in os.environ.get("TELEGRAM_BOT_TOKENS", "").split(",") if t.strip()]
 TELEGRAM_CHAT_IDS = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
+
+if not OPENSEA_API_KEY:
+    raise ValueError("OPENSEA_API_KEY غير مضبوط في ملف .env!")
 
 if not (len(PRIVATE_KEYS) == len(WALLETS) == len(TELEGRAM_BOT_TOKENS) == len(TELEGRAM_CHAT_IDS)):
     raise ValueError("أعداد المفاتيح، المحافظ، توكنات البوتات، و Chat IDs غير متطابقة!")
@@ -55,18 +58,14 @@ INK_RPC_URL = os.environ.get("INK_RPC_URL", "https://rpc-gel.inkonchain.com/")
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
 
-ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
-LOCAL_TZ = timezone(timedelta(hours=3))
-
 # ==================== إعدادات السرعة ====================
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-FREE_PRICE_THRESHOLD_USD = 0.01
-WATCH_POLL_INTERVAL_SECONDS = 1
-PAID_MINTS_CHECK_INTERVAL = 1
-DISCOVERED_MINTS_CHECK_INTERVAL = 2
-PRE_CHECK_INTERVAL = 0.5
+WATCH_POLL_INTERVAL_SECONDS = 0.5
+PAID_MINTS_CHECK_INTERVAL = 0.5
+DISCOVERED_MINTS_CHECK_INTERVAL = 1
+PRE_CHECK_INTERVAL = 0.3
 PAID_MINTS_EXPIRY_SECONDS = 1800
 
 logging.basicConfig(
@@ -217,12 +216,6 @@ def fetch_drop_detail(slug: str):
         log.warning(f"[Drops API] خطأ: {e}")
         return False, None
 
-def parse_iso(ts: str):
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
 # ==================== تحليل المراحل ====================
 
 def analyze_all_stages(slug: str, detail: dict) -> dict:
@@ -230,10 +223,18 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
     eth_price_usd = get_eth_price_usd()
     all_stages = []
     
+    log.info(f"🔍 تحليل مراحل {slug}")
+    
     # 1. المرحلة الحالية
     current = detail.get("active_stage")
     if current:
-        price_wei = int(current.get("price", "0"))
+        price_raw = current.get("price", "0")
+        # ✅ تحويل السعر بشكل صحيح
+        try:
+            price_wei = int(price_raw) if isinstance(price_raw, (int, str)) else 0
+        except:
+            price_wei = 0
+        
         stage_type = current.get("type", "public").lower()
         
         # ✅ التحقق من السعر على السلسلة
@@ -245,16 +246,19 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
                     onchain_price = get_onchain_public_price_wei(w3, contract_address)
                     if onchain_price is not None:
                         price_wei = onchain_price
+                        log.info(f"   سعر on-chain: {price_wei} wei")
                 except:
                     pass
         
         is_free = is_free_or_negligible(price_wei, eth_price_usd)
         is_eligible = stage_type in ["public", "free", "open"] or is_free
         
+        log.info(f"   المرحلة الحالية: {stage_type} | سعر: {price_wei} wei | مجاني: {is_free} | مؤهل: {is_eligible}")
+        
         all_stages.append({
             "name": stage_type,
             "price_wei": price_wei,
-            "price_usd": (price_wei / 1e18) * eth_price_usd,
+            "price_usd": (price_wei / 1e18) * eth_price_usd if price_wei else 0,
             "is_free": is_free,
             "start_time": current.get("start_time"),
             "end_time": current.get("end_time"),
@@ -267,7 +271,12 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
     # 2. المراحل القادمة
     next_stages = detail.get("next_stages", [])
     for stage in next_stages:
-        price_wei = int(stage.get("price", "0"))
+        try:
+            price_raw = stage.get("price", "0")
+            price_wei = int(price_raw) if isinstance(price_raw, (int, str)) else 0
+        except:
+            price_wei = 0
+        
         stage_type = stage.get("type", "unknown").lower()
         
         is_free = is_free_or_negligible(price_wei, eth_price_usd)
@@ -288,7 +297,7 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
         all_stages.append({
             "name": stage_type,
             "price_wei": price_wei,
-            "price_usd": (price_wei / 1e18) * eth_price_usd,
+            "price_usd": (price_wei / 1e18) * eth_price_usd if price_wei else 0,
             "is_free": is_free,
             "start_time": start_time,
             "end_time": stage.get("end_time"),
@@ -494,6 +503,8 @@ async def purchase_task_for_wallet(
 async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict, price_wei: int = None, use_prepared: bool = True):
     """محاولة الشراء"""
     
+    log.info(f"🛒 محاولة شراء {slug}")
+    
     # ✅ تحليل المراحل
     analysis = analyze_all_stages(slug, detail)
     
@@ -516,10 +527,14 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict, pric
     if price_wei is None:
         price_wei = active_free_stage['price_wei']
     
+    log.info(f"💰 سعر المرحلة: {price_wei} wei")
+    
     # ✅ التحقق من الكمية المتبقية
     max_supply = int(detail.get("max_supply") or 0)
     total_supply = int(detail.get("total_supply") or 0)
     remaining = max_supply - total_supply
+    
+    log.info(f"📊 المتبقي: {remaining} من {max_supply}")
     
     if remaining <= 0:
         log.info(f"❌ '{slug}' نفدت الكمية")
@@ -539,7 +554,8 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict, pric
     
     # ✅ التحقق من المجانية
     if not is_free_or_negligible(price_wei, eth_price_usd):
-        log.info(f"💰 '{slug}' مدفوع - ${(price_wei/1e18)*eth_price_usd:.4f}")
+        price_usd = (price_wei / 1e18) * eth_price_usd
+        log.info(f"💰 '{slug}' مدفوع - ${price_usd:.6f}")
         return None
     
     max_per_wallet = active_free_stage.get('max_per_wallet')
@@ -582,7 +598,7 @@ async def prepare_transactions_for_free_stage(slug: str, chain_key: str, detail:
         if not w3:
             return
         
-        price_wei = int(stage.get("price", "0"))
+        price_wei = int(stage.get("price_wei", 0))
         max_per_wallet = stage.get("max_per_wallet")
         
         max_supply = int(detail.get("max_supply") or 0)
@@ -716,7 +732,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                     if stage['status'] == 'past':
                         continue
                     status_text = "🟢 نشطة" if stage['status'] == 'active' else "⏳ قادمة"
-                    price_text = "مجاني" if stage['is_free'] else f"${stage['price_usd']:.4f}"
+                    price_text = "مجاني" if stage['is_free'] else f"${stage['price_usd']:.4f}" if stage['price_usd'] else "غير معروف"
                     log.info(f"   📌 {stage['name']} | {status_text} | {price_text}")
                 
                 discovered_mints.add(slug)
@@ -1074,6 +1090,8 @@ def main():
             break
         except Exception as e:
             log.critical(f"توقف غير متوقع: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(5)
             continue
         else:
