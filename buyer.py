@@ -28,8 +28,8 @@ SEADROP_ABI = [
     {"inputs":[{"name":"nftContract","type":"address"}],"name":"getPublicDrop","outputs":[{"components":[{"name":"mintPrice","type":"uint80"},{"name":"startTime","type":"uint48"},{"name":"endTime","type":"uint48"},{"name":"maxTotalMintableByWallet","type":"uint16"},{"name":"feeBps","type":"uint16"},{"name":"restrictFeeRecipients","type":"bool"}],"name":"","type":"tuple"}],"stateMutability":"view","type":"function"},
 ]
 
-DEFAULT_QUANTITY = 1
-MAX_QUANTITY = 5
+DEFAULT_QUANTITY = 20
+MAX_QUANTITY = 20
 GAS_SAFETY_MARGIN = 1.10
 DEFAULT_RECEIPT_TIMEOUT = 45
 MAX_SEND_RETRIES = 2
@@ -84,14 +84,29 @@ def get_fee_recipient(w3: Web3, nft_contract: str, restrict: bool) -> Optional[s
         return None if restrict else ZERO_ADDRESS
 
 
-def decide_quantity(max_per_wallet, requested: int = DEFAULT_QUANTITY) -> int:
-    q = max(1, min(int(requested), MAX_QUANTITY))
+def decide_quantity(max_per_wallet, remaining_supply: int, requested: int = DEFAULT_QUANTITY) -> int:
+    """Choose the largest safe quantity allowed by the mint, capped at 20.
+
+    Priority: on-chain wallet limit -> known remaining supply -> hard cap 20.
+    A missing wallet limit means no explicit wallet cap was supplied by the
+    public drop, so the hard cap is used.
+    """
+    cap = MAX_QUANTITY
     if max_per_wallet is not None:
-        limit = int(max_per_wallet)
-        if limit <= 0:
-            return 0
-        q = min(q, limit)
-    return q
+        try:
+            wallet_limit = int(max_per_wallet)
+            if wallet_limit <= 0:
+                wallet_limit = MAX_QUANTITY
+            cap = min(cap, wallet_limit)
+        except (TypeError, ValueError):
+            pass
+    try:
+        remaining = int(remaining_supply)
+        if remaining > 0:
+            cap = min(cap, remaining)
+    except (TypeError, ValueError):
+        pass
+    return max(1, cap)
 
 
 def _gas_params(w3: Web3) -> dict:
@@ -175,7 +190,7 @@ def attempt_purchase_single_wallet(
     if not phase["is_active"]:
         return {"success": False, "reason": "phase_not_active", "wallet": wallet, "phase": phase}
 
-    quantity = decide_quantity(min(max_per_wallet or MAX_QUANTITY, remaining_supply), requested_quantity)
+    quantity = decide_quantity(max_per_wallet, remaining_supply, requested_quantity)
     if quantity <= 0:
         return {"success": False, "reason": "wallet_limit", "wallet": wallet}
 
@@ -184,7 +199,8 @@ def attempt_purchase_single_wallet(
         return {"success": False, "reason": "fee_recipient_unavailable", "wallet": wallet}
 
     contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
-    total_value = int(price_wei_per_token) * quantity
+    price_wei_per_token = int(phase["mintPrice"])
+    total_value = price_wei_per_token * quantity
 
     # Retry only the send/build path for transient RPC/nonce errors.
     for attempt in range(MAX_SEND_RETRIES):

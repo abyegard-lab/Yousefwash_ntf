@@ -17,7 +17,7 @@ import websockets
 from dotenv import load_dotenv
 
 from buyer import get_web3, get_onchain_phase_info, attempt_purchase_single_wallet
-from twitter_checker import get_twitter_username_from_opensea, is_valid_twitter_account
+from twitter_checker import get_twitter_username_from_opensea, is_valid_twitter_account, get_last_lookup_status
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
@@ -36,11 +36,13 @@ if not (len(PRIVATE_KEYS) == len(WALLETS) == len(TELEGRAM_BOT_TOKENS) == len(TEL
     raise ValueError("أعداد PRIVATE_KEYS/WALLETS/TELEGRAM_BOT_TOKENS/TELEGRAM_CHAT_IDS غير متطابقة")
 
 INK_RPC_URL = os.environ.get("INK_RPC_URL", "https://rpc-gel.inkonchain.com/")
-MAX_GAS_FEE_USD = float(os.environ.get("MAX_GAS_FEE_USD", "0.01"))
-REQUESTED_QUANTITY = int(os.environ.get("REQUESTED_QUANTITY", "1"))
+MAX_GAS_FEE_USD = float(os.environ.get("MAX_GAS_FEE_USD", "0.05"))
+MAX_BUY_QTY = min(20, max(1, int(os.environ.get("MAX_BUY_QTY", "20"))))
 MAX_PARALLEL_DISCOVERY = int(os.environ.get("MAX_PARALLEL_DISCOVERY", "8"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "2"))
-DROP_CACHE_SECONDS = 1.0
+DROP_CACHE_SECONDS = 0.75
+X_RETRY_SECONDS = 60
+X_NEGATIVE_RETRY_SECONDS = 300
 DB_PATH = os.environ.get("STATE_DB", "nft_bot.sqlite3")
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
@@ -57,6 +59,7 @@ _drop_cache = {}
 _inflight = set()
 _watchlist = {}
 _recent_events = {}
+_x_retry = {}
 _send_queue = asyncio.Queue()
 
 stats = defaultdict(int)
@@ -122,10 +125,13 @@ def get_contract(detail):
 
 def remaining_supply(detail):
     try:
-        mx = int(detail.get("max_supply") or 0); total = int(detail.get("total_supply") or 0)
-        return max(0, mx-total) if mx else 1
+        mx = int(detail.get("max_supply") or 0)
+        total = int(detail.get("total_supply") or 0)
+        # If OpenSea does not expose supply, do not artificially reduce the
+        # quantity to 1; the on-chain wallet limit remains authoritative.
+        return max(0, mx-total) if mx else MAX_BUY_QTY
     except Exception:
-        return 1
+        return MAX_BUY_QTY
 
 
 def telegram_enqueue(text):
@@ -143,8 +149,20 @@ async def telegram_sender():
             _send_queue.task_done()
 
 async def validate_x(slug):
+    """OpenSea-only X check. Temporary OpenSea errors are retryable.
+
+    Returns (status, username): status is True when an X account is present,
+    False when OpenSea explicitly has no username, and None for temporary
+    OpenSea failures such as 429/timeouts.
+    """
     username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
-    return username if username and await asyncio.to_thread(is_valid_twitter_account, username) else None
+    if username and is_valid_twitter_account(username):
+        return True, username
+    # twitter_checker deliberately does not cache temporary failures.
+    # We cannot distinguish them from a negative value here, so evaluate()
+    # will retry the slug rather than permanently rejecting it.
+    return False, None
+
 
 async def buy_for_wallet(slug, detail, wallet_item, phase):
     wallet = wallet_item["wallet"]
@@ -155,7 +173,7 @@ async def buy_for_wallet(slug, detail, wallet_item, phase):
         result = await asyncio.to_thread(
             attempt_purchase_single_wallet, W3, wallet_item["private_key"], wallet,
             get_contract(detail), 0, phase["maxTotalMintableByWallet"], remaining_supply(detail),
-            3000.0, MAX_GAS_FEE_USD, REQUESTED_QUANTITY
+            3000.0, MAX_GAS_FEE_USD, MAX_BUY_QTY
         )
         if result.get("success"):
             save_purchase(slug, wallet, result["tx_hash"], "success", result.get("quantity", 0)); stats["mints_purchased"] += result.get("quantity", 0)
@@ -186,9 +204,21 @@ async def evaluate(slug):
             found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
             if not found or not detail: return
             mark_seen(slug); stats["mints_detected"] += 1
-            username = await validate_x(slug)
+            retry_at = _x_retry.get(slug, 0)
+            if retry_at and time.time() < retry_at:
+                return
+            username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
+            x_status = get_last_lookup_status(slug)
             if not username:
-                log.info("❌ %s: no valid X account", slug); return
+                if x_status == "temporary":
+                    _x_retry[slug] = time.time() + X_RETRY_SECONDS
+                    log.warning("⏳ %s: OpenSea X lookup temporary failure; will retry", slug)
+                else:
+                    _x_retry.pop(slug, None)
+                    log.info("❌ %s: no X account listed by OpenSea", slug)
+                return
+            _x_retry.pop(slug, None)
+            _x_retry.pop(slug, None)
             stage, free = free_stage_active(detail)
             if free:
                 await attempt_mint(slug, detail)
@@ -244,8 +274,19 @@ async def listen_opensea():
 
 async def startup():
     db().close()
-    log.info("🚀 NFT bot V2 started | wallets=%s | max gas=$%.4f | qty=%s", len(WALLETS_DATA), MAX_GAS_FEE_USD, REQUESTED_QUANTITY)
-    telegram_enqueue("🚀 <b>NFT Bot V2 بدأ</b>\n🔗 Ink\n💰 Free mint only\n⛽ حد الغاز: $%.4f\n🔢 الكمية: %s" % (MAX_GAS_FEE_USD, REQUESTED_QUANTITY))
+    log.info(
+        "🚀 NFT bot V2 started | wallets=%s | max gas=$%.4f | qty=auto (cap=%s)",
+        len(WALLETS_DATA), MAX_GAS_FEE_USD, MAX_BUY_QTY
+    )
+    telegram_enqueue(
+        "🚀 <b>NFT Bot V2 بدأ</b>\n"
+        "🔗 Ink\n"
+        "💰 Free mint only\n"
+        "⛽ حد الغاز: $%.4f\n"
+        "🔢 الكمية: تلقائية (حد أقصى %s)\n"
+        "🐦 X: OpenSea فقط" % (MAX_GAS_FEE_USD, MAX_BUY_QTY)
+    )
+
 
 async def run():
     if not BOT_ENABLED:
