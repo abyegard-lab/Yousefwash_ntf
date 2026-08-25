@@ -1,4 +1,4 @@
-# main.py - نسخة محسنة مع فحص مسبق للمراحل والتحضير المسبق للمعاملات
+# main.py - النسخة النهائية مع جميع الإصلاحات
 """
 النظام الكامل — اكتشاف شامل لجميع المينتات بجميع مراحلها
 مع تحضير مسبق للمعاملات للشراء الفوري
@@ -26,6 +26,7 @@ from buyer import (
     get_onchain_public_price_wei,
     get_wallet_lock,
     prepare_transaction_for_wallet,
+    is_free_or_negligible,
 )
 from twitter_checker import get_twitter_username_from_opensea
 
@@ -59,17 +60,16 @@ DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 LOCAL_TZ = timezone(timedelta(hours=3))
 
-# ==================== إعدادات السرعة المحسنة ====================
+# ==================== إعدادات السرعة ====================
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-FREE_PRICE_THRESHOLD_USD = 0.0001
-WATCH_POLL_INTERVAL_SECONDS = 0.5  # ✅ من 5 إلى 0.5 ثانية
-PAID_MINTS_CHECK_INTERVAL = 0.5  # ✅ من 3 إلى 0.5 ثانية
-DISCOVERED_MINTS_CHECK_INTERVAL = 1  # ✅ من 5 إلى 1 ثانية
-PRE_CHECK_INTERVAL = 0.3  # ✅ فحص مسبق كل 0.3 ثانية
+FREE_PRICE_THRESHOLD_USD = 0.001
+WATCH_POLL_INTERVAL_SECONDS = 0.5
+PAID_MINTS_CHECK_INTERVAL = 0.5
+DISCOVERED_MINTS_CHECK_INTERVAL = 1
+PRE_CHECK_INTERVAL = 0.3
 PAID_MINTS_EXPIRY_SECONDS = 1800
-FREE_STAGE_BUFFER_SECONDS = 1  # ✅ تحضير قبل البدء بثانية واحدة
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,7 +89,8 @@ CHAIN_CONFIGS = {
 W3_INSTANCES = {key: get_web3(cfg["rpc_url"]) for key, cfg in CHAIN_CONFIGS.items()}
 STREAM_NAME_TO_CHAIN_KEY = {cfg["stream_chain_name"]: key for key, cfg in CHAIN_CONFIGS.items()}
 
-# تتبع المحافظ التي اشترت بنجاح
+# ==================== التتبع ====================
+
 successful_mints: dict[str, set[str]] = {}
 watchlist: dict[str, dict] = {}
 in_flight: set[str] = set()
@@ -102,7 +103,7 @@ discovered_mints: set[str] = set()
 
 event_counter = defaultdict(int)
 
-DROP_CACHE_DURATION = 3  # ✅ تقليل إلى 3 ثواني
+DROP_CACHE_DURATION = 3
 TWITTER_CACHE_DURATION = 600
 MAX_PARALLEL_TASKS = 10
 
@@ -116,6 +117,8 @@ def get_session():
         _session = requests.Session()
         _session.headers.update({"x-api-key": OPENSEA_API_KEY})
     return _session
+
+# ==================== الإحصائيات ====================
 
 bot_stats = {
     "start_time": time.time(),
@@ -140,6 +143,8 @@ def get_uptime() -> str:
     minutes = (seconds % 3600) // 60
     seconds = seconds % 60
     return f"{hours}h {minutes}m {seconds}s"
+
+# ==================== التخزين المؤقت ====================
 
 _twitter_cache = {}
 _drop_cache = {}
@@ -176,11 +181,13 @@ def is_in_cooldown(slug: str) -> bool:
 def mark_rejected(slug: str):
     rejected_cooldown[slug] = time.time()
 
+# ==================== سعر ETH ====================
+
 _eth_price_cache = {"value": None, "ts": 0}
 
 def get_eth_price_usd() -> float:
     now = time.time()
-    if _eth_price_cache["value"] and (now - _eth_price_cache["ts"] < 60):  # ✅ تقليل إلى 60 ثانية
+    if _eth_price_cache["value"] and (now - _eth_price_cache["ts"] < 60):
         return _eth_price_cache["value"]
     try:
         resp = requests.get(
@@ -196,7 +203,10 @@ def get_eth_price_usd() -> float:
         log.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
         return _eth_price_cache["value"] or 3000.0
 
+# ==================== API ====================
+
 def fetch_drop_detail(slug: str):
+    """جلب تفاصيل المينت من OpenSea API"""
     cached = get_cached_drop(slug)
     if cached is not None:
         return True, cached
@@ -205,19 +215,22 @@ def fetch_drop_detail(slug: str):
         session = get_session()
         resp = session.get(
             f"{DROPS_API_BASE}/{slug}",
-            timeout=3,  # ✅ تقليل المهلة
+            timeout=5,
         )
         bot_stats["api_calls"] += 1
+        
         if resp.status_code == 200:
             detail = resp.json()
             set_cached_drop(slug, detail)
             return True, detail
-        if resp.status_code == 404:
+        elif resp.status_code == 404:
             return False, None
-        return None, None
+        else:
+            log.warning(f"[Drops API] HTTP {resp.status_code} لـ {slug}")
+            return False, None
     except Exception as e:
         log.warning(f"[Drops API] خطأ: {e}")
-        return None, None
+        return False, None
 
 def parse_iso(ts: str):
     try:
@@ -225,64 +238,57 @@ def parse_iso(ts: str):
     except Exception:
         return None
 
-def stage_has_ended(stage: dict) -> bool:
-    end = parse_iso(stage.get("end_time", ""))
-    if not end:
-        return False
-    return datetime.now(timezone.utc) > end
-
-def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
-    price_usd = (price_wei / 1e18) * eth_price_usd
-    return price_usd < FREE_PRICE_THRESHOLD_USD
+# ==================== تحليل المراحل ====================
 
 def analyze_all_stages(slug: str, detail: dict) -> dict:
-    """
-    تحليل شامل لجميع المراحل مع حساب دقيق للوقت المتبقي
-    """
+    """تحليل شامل لجميع المراحل مع حساب دقيق للوقت المتبقي"""
     eth_price_usd = get_eth_price_usd()
-    
     all_stages = []
     
+    # 1. المرحلة الحالية
     current = detail.get("active_stage")
     if current:
         price_wei = int(current.get("price", "0"))
         stage_type = current.get("type", "public").lower()
         
-        auto_eligible_types = ["public", "free", "open"]
-        restricted_types = ["allowlist", "whitelist", "team", "presale", "early_access"]
+        # التحقق من السعر على السلسلة
+        contract_address = detail.get("contract_address")
+        if contract_address:
+            w3 = W3_INSTANCES.get("ink")
+            if w3:
+                try:
+                    onchain_price = get_onchain_public_price_wei(w3, contract_address)
+                    if onchain_price is not None:
+                        price_wei = onchain_price
+                except:
+                    pass
         
-        is_eligible = stage_type in auto_eligible_types
-        
-        if is_free_or_negligible(price_wei, eth_price_usd):
-            is_eligible = True
+        is_free = is_free_or_negligible(price_wei, eth_price_usd)
+        is_eligible = stage_type in ["public", "free", "open"] or is_free
         
         all_stages.append({
             "name": stage_type,
             "price_wei": price_wei,
             "price_usd": (price_wei / 1e18) * eth_price_usd,
-            "is_free": is_free_or_negligible(price_wei, eth_price_usd),
+            "is_free": is_free,
             "start_time": current.get("start_time"),
             "end_time": current.get("end_time"),
             "max_per_wallet": current.get("max_per_wallet"),
             "status": "active",
             "is_eligible": is_eligible,
-            "requires_verification": stage_type in restricted_types,
+            "requires_verification": stage_type in ["allowlist", "whitelist", "team", "presale"],
             "time_until_start": 0,
             "time_until_end": 0,
         })
     
+    # 2. المراحل القادمة
     next_stages = detail.get("next_stages", [])
     for stage in next_stages:
         price_wei = int(stage.get("price", "0"))
         stage_type = stage.get("type", "unknown").lower()
         
-        auto_eligible_types = ["public", "free", "open"]
-        restricted_types = ["allowlist", "whitelist", "team", "presale", "early_access"]
-        
-        is_eligible = stage_type in auto_eligible_types
-        
-        if is_free_or_negligible(price_wei, eth_price_usd):
-            is_eligible = True
+        is_free = is_free_or_negligible(price_wei, eth_price_usd)
+        is_eligible = stage_type in ["public", "free", "open"] or is_free
         
         start_time = stage.get("start_time")
         time_until_start = 0
@@ -294,21 +300,29 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
             except:
                 pass
         
+        if time_until_start <= 0:
+            status = "active"
+        elif time_until_start < 5:
+            status = "imminent"
+        else:
+            status = "upcoming"
+        
         all_stages.append({
             "name": stage_type,
             "price_wei": price_wei,
             "price_usd": (price_wei / 1e18) * eth_price_usd,
-            "is_free": is_free_or_negligible(price_wei, eth_price_usd),
+            "is_free": is_free,
             "start_time": start_time,
             "end_time": stage.get("end_time"),
             "max_per_wallet": stage.get("max_per_wallet"),
-            "status": "imminent" if time_until_start < 5 else "upcoming",
+            "status": status,
             "is_eligible": is_eligible,
-            "requires_verification": stage_type in restricted_types,
+            "requires_verification": stage_type in ["allowlist", "whitelist", "team", "presale"],
             "time_until_start": time_until_start,
             "time_until_end": 0,
         })
     
+    # 3. المراحل السابقة
     past_stages = detail.get("past_stages", [])
     for stage in past_stages:
         price_wei = int(stage.get("price", "0"))
@@ -327,57 +341,32 @@ def analyze_all_stages(slug: str, detail: dict) -> dict:
             "time_until_end": 0,
         })
     
-    # ✅ ترتيب المراحل حسب الوقت المتبقي
-    all_stages.sort(
-        key=lambda s: s.get("time_until_start", float("inf")),
-        reverse=False
-    )
+    # ترتيب المراحل حسب الوقت المتبقي
+    all_stages.sort(key=lambda s: s.get("time_until_start", float("inf")))
     
-    free_stages = []
-    paid_stages = []
-    
-    for stage in all_stages:
-        if stage["status"] == "past":
-            continue
-        if stage["is_free"] and stage["is_eligible"]:
-            free_stages.append(stage)
-        else:
-            paid_stages.append(stage)
-    
-    has_free_active = any(
-        s["is_free"] and s["status"] == "active" and s["is_eligible"] 
-        for s in all_stages
-    )
-    
-    has_free_upcoming = any(
-        s["is_free"] and s["status"] in ["upcoming", "imminent"] and s["is_eligible"] 
-        for s in all_stages
-    )
+    # تحديد المراحل المجانية
+    free_stages = [s for s in all_stages if s["is_free"] and s["is_eligible"] and s["status"] != "past"]
+    has_free_active = any(s["status"] == "active" for s in free_stages)
+    has_free_upcoming = any(s["status"] in ["upcoming", "imminent"] for s in free_stages)
     
     next_free_stage = None
-    for stage in all_stages:
-        if stage["is_free"] and stage["status"] != "past" and stage["is_eligible"]:
-            if stage["status"] == "active":
-                next_free_stage = stage
-                break
-            elif stage["status"] in ["upcoming", "imminent"]:
-                next_free_stage = stage
-                break
+    for s in free_stages:
+        if s["status"] in ["active", "imminent", "upcoming"]:
+            next_free_stage = s
+            break
     
-    result = {
+    return {
         "slug": slug,
         "name": detail.get("collection_name") or slug,
         "all_stages": all_stages,
         "free_stages": free_stages,
-        "paid_stages": paid_stages,
+        "paid_stages": [s for s in all_stages if not s["is_free"]],
         "has_free_active": has_free_active,
         "has_free_upcoming": has_free_upcoming,
         "next_free_stage": next_free_stage,
         "total_stages": len(all_stages),
         "is_minting": detail.get("is_minting", False)
     }
-    
-    return result
 
 # ==================== رسائل التيليجرام ====================
 
@@ -430,7 +419,7 @@ async def telegram_sender():
             log.error(f"❌ خطأ في إرسال تليجرام: {e}")
         finally:
             send_queue.task_done()
-            await asyncio.sleep(0.05)  # ✅ تقليل
+            await asyncio.sleep(0.05)
 
 async def test_telegram():
     log.info("📤 جاري اختبار إرسال رسائل التيليجرام...")
@@ -495,7 +484,7 @@ def build_purchase_message(detail: dict, result: dict, chain_key: str) -> str:
         f"🌐 <a href='{url}'>عرض على OpenSea</a>"
     )
 
-# ==================== دوال الشراء المحسنة ====================
+# ==================== دوال الشراء ====================
 
 async def purchase_task_for_wallet_with_prepare(
     w3, item, slug, contract_address, price_wei, max_per_wallet, 
@@ -515,7 +504,6 @@ async def purchase_task_for_wallet_with_prepare(
         
         log.info(f"🔫 محاولة شراء للمحفظة {wallet_addr[:8]}... - {slug}")
         
-        # ✅ محاولة استخدام المعاملة المحضرة أولاً
         if use_prepared:
             prepared_tx = get_prepared_transaction(slug, wallet_addr, w3)
             if prepared_tx:
@@ -534,7 +522,6 @@ async def purchase_task_for_wallet_with_prepare(
                     enqueue_message(bot_token, chat_id, msg)
                     return res
         
-        # ✅ شراء عادي إذا لم تنجح المحضرة
         res = await asyncio.to_thread(
             attempt_purchase_single_wallet,
             w3, pk, wallet_addr,
@@ -551,7 +538,6 @@ async def purchase_task_for_wallet_with_prepare(
             enqueue_message(bot_token, chat_id, msg)
             log.info(f"✅ شراء ناجح للمحفظة {wallet_addr[:8]}... - {slug}")
             
-            # ✅ تنظيف المعاملة المحضرة
             clear_prepared_transactions(slug, wallet_addr)
         else:
             log.warning(f"❌ فشل شراء للمحفظة {wallet_addr[:8]}... - {slug}: {res.get('reason', 'unknown')}")
@@ -559,50 +545,72 @@ async def purchase_task_for_wallet_with_prepare(
         return res
 
 async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict, price_wei: int = None, use_prepared: bool = True):
-    """
-    محاولة الشراء مع إمكانية تحديد السعر واستخدام المعاملات المحضرة
-    """
-    stage = detail.get("active_stage")
-    if not stage:
+    """محاولة الشراء مع إمكانية تحديد السعر واستخدام المعاملات المحضرة"""
+    
+    # ✅ تحليل المراحل أولاً
+    analysis = analyze_all_stages(slug, detail)
+    
+    if not analysis['has_free_active']:
+        log.info(f"⏳ '{slug}' ليس لديه مرحلة مجانية نشطة حالياً")
         return None
-
+    
+    # ✅ الحصول على المرحلة المجانية النشطة
+    active_free_stage = None
+    for stage in analysis['all_stages']:
+        if stage['is_free'] and stage['status'] == 'active' and stage.get('is_eligible', True):
+            active_free_stage = stage
+            break
+    
+    if not active_free_stage:
+        log.warning(f"⚠️ لا توجد مرحلة مجانية نشطة لـ '{slug}'")
+        return None
+    
+    # ✅ استخدام السعر من المرحلة
+    if price_wei is None:
+        price_wei = active_free_stage['price_wei']
+    
+    # ✅ التحقق من الكمية المتبقية
     max_supply = int(detail.get("max_supply") or 0)
     total_supply = int(detail.get("total_supply") or 0)
     remaining = max_supply - total_supply
+    
     if remaining <= 0:
+        log.info(f"❌ '{slug}' نفدت الكمية")
         return [{"success": False, "reason": "sold_out"}]
-
+    
     contract_address = detail.get("contract_address")
     if not contract_address:
+        log.warning(f"⚠️ '{slug}' لا يوجد عنوان عقد")
         return [{"success": False, "reason": "no_contract_address"}]
-
-    w3 = W3_INSTANCES[chain_key]
+    
+    w3 = W3_INSTANCES.get(chain_key)
+    if not w3:
+        log.warning(f"⚠️ لا يوجد W3 للشبكة {chain_key}")
+        return None
+    
     eth_price_usd = get_eth_price_usd()
-
-    if price_wei is None:
-        onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
-        price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
-
+    
+    # ✅ التحقق من المجانية
     if not is_free_or_negligible(price_wei, eth_price_usd):
         log.info(f"💰 '{slug}' مدفوع - تجاهل (${(price_wei/1e18)*eth_price_usd:.4f})")
         return None
-
-    max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
-    max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
-    max_gas_fee_usd = CHAIN_CONFIGS[chain_key]["max_gas_fee_usd"]
-
+    
+    max_per_wallet = active_free_stage.get('max_per_wallet')
+    max_gas_fee_usd = CHAIN_CONFIGS.get(chain_key, {}).get("max_gas_fee_usd", 0.50)
+    
     already_bought_wallets = successful_mints.get(slug, set())
     pending_items = [item for item in WALLETS_DATA if item["wallet"] not in already_bought_wallets]
-
+    
     if not pending_items:
+        log.info(f"✅ جميع المحافظ اشتريت لـ '{slug}'")
         return [{"success": False, "reason": "all_wallets_completed"}]
-
+    
     log.info(f"🛒 بدء الشراء لـ {slug} - {len(pending_items)} محافظ متبقية")
-
+    
     for item in pending_items:
         item["current_detail"] = detail
         item["chain_key"] = chain_key
-
+    
     tasks = [
         purchase_task_for_wallet_with_prepare(
             w3, item, slug, contract_address,
@@ -611,22 +619,23 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict, pric
         )
         for item in pending_items
     ]
-
+    
     results = await asyncio.gather(*tasks)
     return list(results)
 
 # ==================== التحضير المسبق للمعاملات ====================
 
 async def prepare_transactions_for_free_stage(slug: str, chain_key: str, detail: dict, stage: dict):
-    """
-    تحضير المعاملات مسبقاً لمرحلة مجانية قادمة
-    """
+    """تحضير المعاملات مسبقاً لمرحلة مجانية قادمة"""
     try:
         contract_address = detail.get("contract_address")
         if not contract_address:
             return
         
-        w3 = W3_INSTANCES[chain_key]
+        w3 = W3_INSTANCES.get(chain_key)
+        if not w3:
+            return
+        
         price_wei = int(stage.get("price", "0"))
         max_per_wallet = stage.get("max_per_wallet")
         
@@ -660,9 +669,7 @@ async def prepare_transactions_for_free_stage(slug: str, chain_key: str, detail:
 # ==================== الفحص المسبق للمراحل القادمة ====================
 
 async def enhanced_pre_check():
-    """
-    فحص مسبق مستمر للمراحل القادمة مع تحضير مسبق للمعاملات
-    """
+    """فحص مسبق مستمر للمراحل القادمة مع تحضير مسبق للمعاملات"""
     while True:
         try:
             await asyncio.sleep(PRE_CHECK_INTERVAL)
@@ -711,10 +718,8 @@ async def enhanced_pre_check():
             await asyncio.sleep(0.5)
 
 async def immediate_buy_at_stage_start(slug: str, chain_key: str):
-    """
-    شراء فوري عند بدء المرحلة باستخدام المعاملات المحضرة
-    """
-    await asyncio.sleep(0.3)  # تأخير بسيط لضمان بدء المرحلة
+    """شراء فوري عند بدء المرحلة باستخدام المعاملات المحضرة"""
+    await asyncio.sleep(0.3)
     
     # ✅ جلب أحدث البيانات
     found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
@@ -724,7 +729,6 @@ async def immediate_buy_at_stage_start(slug: str, chain_key: str):
     analysis = analyze_all_stages(slug, detail)
     
     if not analysis['has_free_active']:
-        # ✅ تحقق مرة أخرى بعد 0.3 ثانية
         await asyncio.sleep(0.3)
         found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
         if not found:
@@ -736,14 +740,13 @@ async def immediate_buy_at_stage_start(slug: str, chain_key: str):
     
     log.info(f"🚀 شراء فوري لـ '{slug}' باستخدام المعاملات المحضرة!")
     
-    # ✅ استخدام المعاملات المحضرة
     results = await try_buy_now_multi_wallet(slug, chain_key, detail, use_prepared=True)
     
     if results:
         successful_count = sum(1 for r in results if r.get("success"))
         log.info(f"✅ تم شراء {successful_count} من {len(results)} محافظ لـ '{slug}'")
 
-# ==================== تقييم شامل للمينتات ====================
+# ==================== تقييم المينتات ====================
 
 async def evaluate_new_mint_fast(slug: str, chain_key: str):
     """تقييم شامل - يكتشف جميع المراحل مع تحضير مسبق"""
@@ -786,6 +789,7 @@ async def evaluate_new_mint_fast(slug: str, chain_key: str):
                 discovered_mints.add(slug)
                 bot_stats["mints_detected"] += 1
 
+            # ✅ التحقق من Twitter
             twitter_username = get_cached_twitter(slug)
             if twitter_username is None:
                 try:
@@ -939,7 +943,7 @@ async def scan_paid_mints():
             bot_stats["errors"] += 1
             await asyncio.sleep(0.5)
 
-# ==================== الفحص الدوري للمينتات المكتشفة ====================
+# ==================== الفحص الدوري ====================
 
 async def check_all_discovered_mints():
     """فحص دوري سريع لجميع المينتات المكتشفة"""
@@ -1011,7 +1015,6 @@ async def check_all_discovered_mints():
                         "next_free_stage": next_free
                     }
                     
-                    # ✅ تحضير مسبق إذا كان قريباً
                     if next_free and next_free.get('time_until_start', float('inf')) < 10:
                         await prepare_transactions_for_free_stage(slug, "ink", detail, next_free)
                         
@@ -1060,7 +1063,6 @@ async def watch_loop():
                             "analysis": analysis,
                             "next_free_stage": next_free
                         }
-                        # ✅ تحضير مسبق
                         if next_free and next_free.get('time_until_start', float('inf')) < 10:
                             await prepare_transactions_for_free_stage(slug, chain_key, fresh_detail, next_free)
                     watchlist.pop(slug, None)
@@ -1084,12 +1086,12 @@ async def watch_loop():
             finally:
                 in_flight.discard(slug)
 
-# ==================== الاستماع الشامل إلى OpenSea ====================
+# ==================== الاستماع إلى OpenSea ====================
 
 async def listen_opensea_fast():
     msg_ref = 0
     recent_mints = {}
-    RECENT_WINDOW = 1  # ✅ تقليل إلى 1 ثانية
+    RECENT_WINDOW = 1
     reconnect_attempts = 0
     
     while True:
@@ -1124,7 +1126,7 @@ async def listen_opensea_fast():
                         msg_ref += 1
                         last_heartbeat = time.time()
                         
-                        if time.time() - last_event_time > 45:  # ✅ تقليل إلى 45 ثانية
+                        if time.time() - last_event_time > 45:
                             log.warning(f"⚠️ لم تصل أي أحداث منذ {int(time.time() - last_event_time)} ثانية")
                             log.info("🔄 إعادة الاتصال بسبب عدم وجود أحداث...")
                             break
@@ -1155,15 +1157,9 @@ async def listen_opensea_fast():
                             log.info(f"📨 حدث #{events_received}: {event_name}")
                         
                         accepted_events = [
-                            "item_transferred", 
-                            "item_listed", 
-                            "collection_created", 
-                            "item_received", 
-                            "item_sold",
-                            "item_metadata_updated",
-                            "collection_updated",
-                            "item_cancelled",
-                            "item_offered",
+                            "item_transferred", "item_listed", "collection_created", 
+                            "item_received", "item_sold", "item_metadata_updated",
+                            "collection_updated", "item_cancelled", "item_offered",
                             "collection_offer_created"
                         ]
                         
@@ -1245,7 +1241,7 @@ async def run():
         listen_opensea_fast(),
         scan_paid_mints(),
         check_all_discovered_mints(),
-        enhanced_pre_check(),  # ✅ الفحص المسبق المحسن
+        enhanced_pre_check(),
         watch_loop(),
         telegram_sender()
     )
