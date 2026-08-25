@@ -114,7 +114,7 @@ def estimate_fee_usd(w3: Web3, tx: dict, eth_price_usd: float) -> tuple[float, i
     try:
         gas = int(w3.eth.estimate_gas(tx))
     except Exception:
-        gas = 21000  # قيمة افتراضية
+        gas = 21000
     
     try:
         gas_price = int(w3.eth.gas_price)
@@ -138,20 +138,6 @@ def attempt_purchase(
 ) -> dict:
     """
     محاولة شراء NFT من عقد SeaDrop
-    
-    المعاملات:
-        w3: كائن Web3
-        private_key: المفتاح الخاص للمحفظة
-        wallet: عنوان المحفظة
-        nft_contract: عنوان عقد NFT
-        eth_price_usd: سعر الإيثيريوم بالدولار
-        max_gas_fee_usd: الحد الأقصى لرسوم الغاز
-        remaining_supply: الكمية المتبقية
-        max_qty: الحد الأقصى للكمية لكل معاملة
-        chain_id: معرف الشبكة (اختياري)
-    
-    الإرجاع:
-        dict: نتيجة العملية
     """
     wallet = Web3.to_checksum_address(wallet)
     nft_contract = Web3.to_checksum_address(nft_contract)
@@ -176,7 +162,6 @@ def attempt_purchase(
     # اختيار الكمية
     quantity = choose_quantity(drop, remaining_supply, max_qty)
     
-    # الحصول على مستلم الرسوم
     try:
         fee_recipient = get_fee_recipient(w3, nft_contract, drop)
     except Exception as e:
@@ -185,7 +170,6 @@ def attempt_purchase(
     contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=ABI)
     total_value = int(drop["mintPrice"]) * quantity
 
-    # الحصول على nonce
     try:
         nonce = int(w3.eth.get_transaction_count(wallet, "pending"))
     except Exception as e:
@@ -200,7 +184,7 @@ def attempt_purchase(
 
     call_args = [nft_contract, fee_recipient, wallet, quantity]
     
-    # محاكاة المعاملة للتحقق من عدم فشلها
+    # محاكاة المعاملة
     try:
         contract.functions.mintPublic(*call_args).call(tx_base)
     except ContractLogicError as e:
