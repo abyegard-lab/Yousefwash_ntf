@@ -1,11 +1,14 @@
-# main.py - نسخة مبسطة ومُصححة
+# main.py - نسخة معدلة مع دعم كامل للمراحل المتعددة
+"""
+النظام الكامل — اكتشاف شامل لجميع المينتات بجميع مراحلها
+"""
 
 import asyncio
 import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 import requests
@@ -17,50 +20,51 @@ from buyer import (
     attempt_purchase_single_wallet,
     get_onchain_public_price_wei,
     get_wallet_lock,
-    is_free_or_negligible,
 )
 from twitter_checker import get_twitter_username_from_opensea
 
 load_dotenv()
 
-# ==================== قراءة الإعدادات ====================
-
-OPENSEA_API_KEY = os.environ.get("OPENSEA_API_KEY", "")
+OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
 
+# تفكيك المحافظ والمفاتيح وإعدادات التيليجرام
 PRIVATE_KEYS = [k.strip() for k in os.environ.get("PRIVATE_KEYS", "").split(",") if k.strip()]
 WALLETS = [w.strip() for w in os.environ.get("WALLETS", "").split(",") if w.strip()]
 TELEGRAM_BOT_TOKENS = [t.strip() for t in os.environ.get("TELEGRAM_BOT_TOKENS", "").split(",") if t.strip()]
 TELEGRAM_CHAT_IDS = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
 
-if not OPENSEA_API_KEY:
-    raise ValueError("OPENSEA_API_KEY غير مضبوط في ملف .env!")
+if not (len(PRIVATE_KEYS) == len(WALLETS) == len(TELEGRAM_BOT_TOKENS) == len(TELEGRAM_CHAT_IDS)):
+    raise ValueError("أعداد المفاتيح، المحافظ، توكنات البوتات، و Chat IDs غير متطابقة في ملف .env!")
 
-if not PRIVATE_KEYS:
-    raise ValueError("PRIVATE_KEYS غير مضبوط في ملف .env!")
-
-if len(PRIVATE_KEYS) != len(WALLETS):
-    raise ValueError("عدد PRIVATE_KEYS لا يساوي عدد WALLETS!")
-
+# إنشاء هيكلية المحافظ
 WALLETS_DATA = []
 for i in range(len(WALLETS)):
     WALLETS_DATA.append({
         "wallet": WALLETS[i],
         "private_key": PRIVATE_KEYS[i],
-        "bot_token": TELEGRAM_BOT_TOKENS[i] if i < len(TELEGRAM_BOT_TOKENS) else "",
-        "chat_id": TELEGRAM_CHAT_IDS[i] if i < len(TELEGRAM_CHAT_IDS) else "",
+        "bot_token": TELEGRAM_BOT_TOKENS[i],
+        "chat_id": TELEGRAM_CHAT_IDS[i],
     })
 
+# RPC مجاني لشبكة Ink
 INK_RPC_URL = os.environ.get("INK_RPC_URL", "https://rpc-gel.inkonchain.com/")
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
 
-# ==================== إعدادات ====================
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+LOCAL_TZ = timezone(timedelta(hours=3))
 
-FREE_PRICE_THRESHOLD_USD = 0.0001
-SCAN_INTERVAL = 1  # ثانية
-CHECK_INTERVAL = 1  # ثانية
+# ==================== إعدادات السرعة المحسنة ====================
+
+HEARTBEAT_INTERVAL = 20
+RECV_TIMEOUT = 5
+FREE_PRICE_THRESHOLD_USD = 0.01  # ✅ زيادة العتبة
+WATCH_POLL_INTERVAL_SECONDS = 1  # ✅ من 5 إلى 1
+PAID_MINTS_CHECK_INTERVAL = 1  # ✅ من 3 إلى 1
+DISCOVERED_MINTS_CHECK_INTERVAL = 2  # ✅ من 5 إلى 2
+PAID_MINTS_EXPIRY_SECONDS = 1800
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,47 +73,113 @@ logging.basicConfig(
 )
 log = logging.getLogger("auto-buyer")
 
+# تكوين شبكة Ink فقط
 CHAIN_CONFIGS = {
     "ink": {
+        "stream_chain_name": "ink",
         "rpc_url": INK_RPC_URL,
         "max_gas_fee_usd": 0.50,
     },
 }
 
 W3_INSTANCES = {key: get_web3(cfg["rpc_url"]) for key, cfg in CHAIN_CONFIGS.items()}
+STREAM_NAME_TO_CHAIN_KEY = {cfg["stream_chain_name"]: key for key, cfg in CHAIN_CONFIGS.items()}
 
-# ==================== التتبع ====================
-
+# تتبع المحافظ التي اشترت بنجاح
 successful_mints: dict[str, set[str]] = {}
-discovered_mints: set[str] = set()
-tracked_mints: dict[str, dict] = {}
+watchlist: dict[str, dict] = {}
 in_flight: set[str] = set()
+
+REJECTION_COOLDOWN_SECONDS = 120
+rejected_cooldown: dict[str, float] = {}
+
+paid_mints_tracking: dict[str, dict] = {}
+discovered_mints: set[str] = set()
+
+event_counter = defaultdict(int)
+
+# ==================== إعدادات السرعة ====================
+
+DROP_CACHE_DURATION = 3  # ✅ من 5 إلى 3
+TWITTER_CACHE_DURATION = 600
+MAX_PARALLEL_TASKS = 10
+
+semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
+
+# استخدام Session
+_session = None
+
+def get_session():
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update({"x-api-key": OPENSEA_API_KEY})
+    return _session
+
+# ==================== إحصائيات البوت ====================
+
+bot_stats = {
+    "start_time": time.time(),
+    "mints_detected": 0,
+    "mints_purchased": 0,
+    "purchase_attempts": 0,
+    "api_calls": 0,
+    "conversions_detected": 0,
+    "errors": 0,
+    "total_gas_spent": 0.0,
+    "mints_per_chain": defaultdict(int),
+    "wallets_used": set(),
+    "telegram_messages_sent": 0,
+    "telegram_errors": 0,
+    "events_received": 0,
+}
+
+def get_uptime() -> str:
+    seconds = int(time.time() - bot_stats["start_time"])
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{hours}h {minutes}m {seconds}s"
 
 # ==================== التخزين المؤقت ====================
 
-_drop_cache = {}
 _twitter_cache = {}
+_drop_cache = {}
 _eth_price_cache = {"value": None, "ts": 0}
+
+def get_cached_twitter(slug: str):
+    if slug in _twitter_cache:
+        username, timestamp = _twitter_cache[slug]
+        if time.time() - timestamp < TWITTER_CACHE_DURATION:
+            return username
+    return None
+
+def set_cached_twitter(slug: str, username):
+    _twitter_cache[slug] = (username, time.time())
 
 def get_cached_drop(slug: str):
     if slug in _drop_cache:
         detail, timestamp = _drop_cache[slug]
-        if time.time() - timestamp < 5:
+        if time.time() - timestamp < DROP_CACHE_DURATION:
             return detail
     return None
 
 def set_cached_drop(slug: str, detail):
     _drop_cache[slug] = (detail, time.time())
 
-def get_cached_twitter(slug: str):
-    if slug in _twitter_cache:
-        username, timestamp = _twitter_cache[slug]
-        if time.time() - timestamp < 600:
-            return username
-    return None
+# ==================== الوظائف الأساسية ====================
 
-def set_cached_twitter(slug: str, username):
-    _twitter_cache[slug] = (username, time.time())
+def is_in_cooldown(slug: str) -> bool:
+    ts = rejected_cooldown.get(slug)
+    if ts is None:
+        return False
+    if time.time() - ts >= REJECTION_COOLDOWN_SECONDS:
+        rejected_cooldown.pop(slug, None)
+        return False
+    return True
+
+def mark_rejected(slug: str):
+    rejected_cooldown[slug] = time.time()
 
 def get_eth_price_usd() -> float:
     now = time.time()
@@ -123,47 +193,212 @@ def get_eth_price_usd() -> float:
         price = resp.json()["ethereum"]["usd"]
         _eth_price_cache["value"] = price
         _eth_price_cache["ts"] = now
+        bot_stats["api_calls"] += 1
         return price
     except Exception as e:
-        log.warning(f"[السعر] خطأ: {e}")
+        log.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
         return _eth_price_cache["value"] or 3000.0
 
-# ==================== API ====================
-
-_session = None
-
-def get_session():
-    global _session
-    if _session is None:
-        _session = requests.Session()
-        _session.headers.update({"x-api-key": OPENSEA_API_KEY})
-    return _session
-
 def fetch_drop_detail(slug: str):
-    """جلب تفاصيل المينت"""
     cached = get_cached_drop(slug)
     if cached is not None:
-        return cached
+        return True, cached
     
     try:
         session = get_session()
-        resp = session.get(f"{DROPS_API_BASE}/{slug}", timeout=5)
-        
+        resp = session.get(
+            f"{DROPS_API_BASE}/{slug}",
+            timeout=5,
+        )
+        bot_stats["api_calls"] += 1
         if resp.status_code == 200:
             detail = resp.json()
             set_cached_drop(slug, detail)
-            return detail
+            return True, detail
         else:
-            log.warning(f"[API] HTTP {resp.status_code} لـ {slug}")
-            return None
+            log.warning(f"[Drops API] HTTP {resp.status_code} لـ {slug}")
+            return False, None
     except Exception as e:
-        log.warning(f"[API] خطأ لـ {slug}: {e}")
+        log.warning(f"[Drops API] خطأ: {e}")
+        return False, None
+
+def parse_iso(ts: str):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
         return None
 
-# ==================== تحليل المراحل ====================
+def stage_has_ended(stage: dict) -> bool:
+    end = parse_iso(stage.get("end_time", ""))
+    if not end:
+        return False
+    return datetime.now(timezone.utc) > end
 
-def get_free_stage(detail: dict) -> dict:
-    """الحصول على المرحلة المجانية من التفاصيل"""
+def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
+    if price_wei is None:
+        return False
+    if price_wei == 0:
+        return True
+    price_usd = (price_wei / 1e18) * eth_price_usd
+    return price_usd < FREE_PRICE_THRESHOLD_USD
+
+# ==================== تحليل شامل للمراحل ====================
+
+def analyze_all_stages(slug: str, detail: dict) -> dict:
+    """
+    تحليل شامل لجميع المراحل مع التحقق من الأهلية
+    """
+    eth_price_usd = get_eth_price_usd()
+    
+    all_stages = []
+    
+    # 1. المرحلة الحالية (active_stage)
+    current = detail.get("active_stage")
+    if current:
+        price_wei = int(current.get("price", "0"))
+        
+        stage_type = current.get("type", "public").lower()
+        
+        auto_eligible_types = ["public", "free", "open"]
+        restricted_types = ["allowlist", "whitelist", "team", "presale", "early_access"]
+        
+        is_eligible = stage_type in auto_eligible_types
+        
+        if is_free_or_negligible(price_wei, eth_price_usd):
+            is_eligible = True
+        
+        all_stages.append({
+            "name": stage_type,
+            "price_wei": price_wei,
+            "price_usd": (price_wei / 1e18) * eth_price_usd,
+            "is_free": is_free_or_negligible(price_wei, eth_price_usd),
+            "start_time": current.get("start_time"),
+            "end_time": current.get("end_time"),
+            "max_per_wallet": current.get("max_per_wallet"),
+            "status": "active",
+            "is_eligible": is_eligible,
+            "requires_verification": stage_type in restricted_types
+        })
+    
+    # 2. المراحل القادمة (next_stages)
+    next_stages = detail.get("next_stages", [])
+    for stage in next_stages:
+        price_wei = int(stage.get("price", "0"))
+        stage_type = stage.get("type", "unknown").lower()
+        
+        auto_eligible_types = ["public", "free", "open"]
+        restricted_types = ["allowlist", "whitelist", "team", "presale", "early_access"]
+        
+        is_eligible = stage_type in auto_eligible_types
+        
+        if is_free_or_negligible(price_wei, eth_price_usd):
+            is_eligible = True
+        
+        # حساب الوقت المتبقي
+        start_time = stage.get("start_time")
+        time_until_start = float('inf')
+        if start_time:
+            try:
+                start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                time_until_start = (start_dt - datetime.now(timezone.utc)).total_seconds()
+                time_until_start = max(0, time_until_start)
+            except:
+                pass
+        
+        # تحديد الحالة
+        status = "upcoming"
+        if time_until_start < 5:
+            status = "imminent"  # ✅ مرحلة وشك
+        elif time_until_start <= 0:
+            status = "active"
+        
+        all_stages.append({
+            "name": stage_type,
+            "price_wei": price_wei,
+            "price_usd": (price_wei / 1e18) * eth_price_usd,
+            "is_free": is_free_or_negligible(price_wei, eth_price_usd),
+            "start_time": start_time,
+            "end_time": stage.get("end_time"),
+            "max_per_wallet": stage.get("max_per_wallet"),
+            "status": status,
+            "is_eligible": is_eligible,
+            "requires_verification": stage_type in restricted_types,
+            "time_until_start": time_until_start
+        })
+    
+    # 3. المراحل السابقة (past_stages)
+    past_stages = detail.get("past_stages", [])
+    for stage in past_stages:
+        price_wei = int(stage.get("price", "0"))
+        all_stages.append({
+            "name": stage.get("type", "unknown"),
+            "price_wei": price_wei,
+            "price_usd": (price_wei / 1e18) * eth_price_usd,
+            "is_free": is_free_or_negligible(price_wei, eth_price_usd),
+            "start_time": stage.get("start_time"),
+            "end_time": stage.get("end_time"),
+            "max_per_wallet": stage.get("max_per_wallet"),
+            "status": "past",
+            "is_eligible": False,
+            "requires_verification": False
+        })
+    
+    # 4. البحث عن مراحل مجانية (حالية أو قادمة)
+    free_stages = []
+    paid_stages = []
+    
+    for stage in all_stages:
+        if stage["status"] == "past":
+            continue
+        if stage["is_free"] and stage["is_eligible"]:
+            free_stages.append(stage)
+        else:
+            paid_stages.append(stage)
+    
+    # 5. هل يوجد مرحلة مجانية حالياً؟
+    has_free_active = any(
+        s["is_free"] and s["status"] == "active" and s["is_eligible"] 
+        for s in all_stages
+    )
+    
+    # 6. هل توجد مرحلة مجانية قادمة أو وشك؟
+    has_free_upcoming = any(
+        s["is_free"] and s["status"] in ["upcoming", "imminent"] and s["is_eligible"] 
+        for s in all_stages
+    )
+    
+    # 7. المرحلة المجانية التالية
+    next_free_stage = None
+    for stage in all_stages:
+        if stage["is_free"] and stage["status"] != "past" and stage["is_eligible"]:
+            if stage["status"] == "active":
+                next_free_stage = stage
+                break
+            elif stage["status"] in ["imminent", "upcoming"]:
+                next_free_stage = stage
+                break
+    
+    result = {
+        "slug": slug,
+        "name": detail.get("collection_name") or slug,
+        "all_stages": all_stages,
+        "free_stages": free_stages,
+        "paid_stages": paid_stages,
+        "has_free_active": has_free_active,
+        "has_free_upcoming": has_free_upcoming,
+        "next_free_stage": next_free_stage,
+        "total_stages": len(all_stages),
+        "is_minting": detail.get("is_minting", False)
+    }
+    
+    return result
+
+# ==================== دالة البحث عن المرحلة المجانية ====================
+
+def get_free_stage_from_detail(detail: dict) -> dict:
+    """
+    استخراج المرحلة المجانية من تفاصيل المينت
+    """
     eth_price_usd = get_eth_price_usd()
     
     # 1. فحص المرحلة الحالية
@@ -179,9 +414,12 @@ def get_free_stage(detail: dict) -> dict:
         if contract_address:
             w3 = W3_INSTANCES.get("ink")
             if w3:
-                onchain_price = get_onchain_public_price_wei(w3, contract_address)
-                if onchain_price is not None:
-                    price_wei = onchain_price
+                try:
+                    onchain_price = get_onchain_public_price_wei(w3, contract_address)
+                    if onchain_price is not None:
+                        price_wei = onchain_price
+                except:
+                    pass
         
         if is_free_or_negligible(price_wei, eth_price_usd):
             stage_type = current.get("type", "public").lower()
@@ -190,10 +428,12 @@ def get_free_stage(detail: dict) -> dict:
                     "price_wei": price_wei,
                     "max_per_wallet": current.get("max_per_wallet"),
                     "status": "active",
-                    "name": stage_type,
+                    "stage": current
                 }
+        except:
+            pass
     
-    # 2. فحص المراحل القادمة
+    # 2. فحص المراحل القادمة (للمراحل التي ستبدأ قريباً)
     next_stages = detail.get("next_stages", [])
     for stage in next_stages:
         try:
@@ -201,306 +441,793 @@ def get_free_stage(detail: dict) -> dict:
         except:
             price_wei = 0
         
-        stage_type = stage.get("type", "unknown").lower()
-        
         if is_free_or_negligible(price_wei, eth_price_usd):
+            stage_type = stage.get("type", "unknown").lower()
             if stage_type in ["public", "free", "open"] or price_wei == 0:
                 start_time = stage.get("start_time")
                 if start_time:
                     try:
                         start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
                         time_until = (start_dt - datetime.now(timezone.utc)).total_seconds()
-                        if time_until < 10:  # قريباً
+                        if time_until < 10:  # قريباً (أقل من 10 ثواني)
                             return {
                                 "price_wei": price_wei,
                                 "max_per_wallet": stage.get("max_per_wallet"),
                                 "status": "imminent",
-                                "name": stage_type,
-                                "start_time": start_time,
+                                "stage": stage,
+                                "time_until": time_until
                             }
                     except:
                         pass
+        except:
+            pass
     
     return None
 
-# ==================== دوال الشراء ====================
+# ==================== رسائل التيليجرام ====================
 
-async def buy_for_wallet(w3, wallet_data, slug, contract_address, price_wei, max_per_wallet, remaining, eth_price_usd):
-    """شراء لمحفظة واحدة"""
-    wallet_addr = wallet_data["wallet"]
-    pk = wallet_data["private_key"]
+send_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+
+def enqueue_message(bot_token: str, chat_id: str, text: str):
+    send_queue.put_nowait({
+        "bot_token": bot_token,
+        "chat_id": chat_id,
+        "text": text
+    })
+
+def broadcast_message(text: str):
+    for w in WALLETS_DATA:
+        enqueue_message(w["bot_token"], w["chat_id"], text)
+
+async def telegram_sender():
+    while True:
+        msg = await send_queue.get()
+        try:
+            bot_token = msg.get("bot_token")
+            chat_id = msg.get("chat_id")
+            text = msg.get("text", "")
+            
+            if not bot_token or not chat_id:
+                send_queue.task_done()
+                continue
+            
+            telegram_api = f"https://api.telegram.org/bot{bot_token}"
+            response = await asyncio.to_thread(
+                requests.post,
+                f"{telegram_api}/sendMessage",
+                data={
+                    "chat_id": chat_id, 
+                    "text": text, 
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                },
+                timeout=10,
+            )
+            
+            if response.status_code == 200:
+                bot_stats["telegram_messages_sent"] += 1
+            else:
+                bot_stats["telegram_errors"] += 1
+                log.error(f"❌ فشل إرسال تليجرام: {response.status_code}")
+                
+        except Exception as e:
+            bot_stats["telegram_errors"] += 1
+            log.error(f"❌ خطأ في إرسال تليجرام: {e}")
+        finally:
+            send_queue.task_done()
+            await asyncio.sleep(0.05)
+
+async def test_telegram():
+    log.info("📤 جاري اختبار إرسال رسائل التيليجرام...")
     
+    for i, w in enumerate(WALLETS_DATA):
+        try:
+            bot_token = w["bot_token"]
+            chat_id = w["chat_id"]
+            
+            test_msg = f"🧪 <b>رسالة اختبار</b>\n\nالبوت #{i+1}\nالمحفظة: {w['wallet'][:8]}...\nالشبكة: Ink\nالوقت: {datetime.now().strftime('%H:%M:%S')}"
+            
+            telegram_api = f"https://api.telegram.org/bot{bot_token}"
+            resp = requests.post(
+                f"{telegram_api}/sendMessage",
+                data={"chat_id": chat_id, "text": test_msg, "parse_mode": "HTML"},
+                timeout=8,
+            )
+            
+            if resp.status_code == 200:
+                log.info(f"✅ تم إرسال رسالة اختبار للبوت #{i+1}")
+                bot_stats["telegram_messages_sent"] += 1
+            else:
+                log.error(f"❌ فشل إرسال رسالة اختبار للبوت #{i+1}: {resp.status_code}")
+                bot_stats["telegram_errors"] += 1
+                
+        except Exception as e:
+            log.error(f"❌ خطأ في اختبار البوت #{i+1}: {e}")
+            bot_stats["telegram_errors"] += 1
+
+# ==================== رسائل الإشعارات ====================
+
+def build_startup_message() -> str:
+    wallet_count = len(WALLETS_DATA)
+    return (
+        f"🚀 <b>تم تشغيل البوت بنجاح!</b>\n\n"
+        f"📊 عدد المحافظ: {wallet_count}\n"
+        f"🔗 الشبكة: Ink\n"
+        f"⚡ الوضع: اكتشاف شامل (جميع المراحل)\n"
+        f"💰 المينتات: مجانية فقط\n"
+        f"🔄 جارٍ المراقبة..."
+    )
+
+def build_purchase_message(detail: dict, result: dict, chain_key: str) -> str:
+    name = detail.get("collection_name") or detail.get("collection_slug")
+    url = detail.get("opensea_url", "")
+    w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
+    
+    bot_stats["mints_purchased"] += 1
+    bot_stats["total_gas_spent"] += result.get('gas_fee_usd', 0)
+    bot_stats["mints_per_chain"][chain_key] += 1
+    bot_stats["wallets_used"].add(result['wallet'])
+    
+    return (
+        f"✅ <b>تم الشراء بنجاح!</b>\n\n"
+        f"📦 المجموعة: <b>{name}</b>\n"
+        f"🔗 الشبكة: Ink\n"
+        f"👛 المحفظة: <code>{w_short}</code>\n"
+        f"🔢 الكمية: {result['quantity']}\n"
+        f"⛽ رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
+        f"🔗 المعاملة: <code>{result['tx_hash'][:10]}...</code>\n"
+        f"🌐 <a href='{url}'>عرض على OpenSea</a>"
+    )
+
+# ---------------------------------------------------------------------------
+# الشراء
+# ---------------------------------------------------------------------------
+
+async def purchase_task_for_wallet(
+    w3, item, slug, contract_address, price_wei, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
+):
+    wallet_addr = item["wallet"]
+    pk = item["private_key"]
+    bot_token = item["bot_token"]
+    chat_id = item["chat_id"]
+
     lock = get_wallet_lock(wallet_addr)
     async with lock:
         if wallet_addr in successful_mints.get(slug, set()):
-            return {"success": False, "reason": "already_bought"}
+            return {"success": False, "wallet": wallet_addr, "reason": "already_bought"}
+
+        bot_stats["purchase_attempts"] += 1
         
-        log.info(f"🔫 شراء للمحفظة {wallet_addr[:8]}...")
+        log.info(f"🔫 محاولة شراء للمحفظة {wallet_addr[:8]}... - {slug}")
         
-        result = await asyncio.to_thread(
+        res = await asyncio.to_thread(
             attempt_purchase_single_wallet,
             w3, pk, wallet_addr,
             contract_address, price_wei, max_per_wallet, remaining,
-            eth_price_usd, 0.50,
+            eth_price_usd, max_gas_fee_usd,
         )
-        
-        if result.get("success"):
+
+        if res.get("success"):
             if slug not in successful_mints:
                 successful_mints[slug] = set()
             successful_mints[slug].add(wallet_addr)
-            log.info(f"✅ شراء ناجح للمحفظة {wallet_addr[:8]}...")
             
-            # إرسال رسالة تليجرام
-            bot_token = wallet_data.get("bot_token")
-            chat_id = wallet_data.get("chat_id")
-            if bot_token and chat_id:
-                try:
-                    name = detail.get("collection_name") or slug
-                    msg = f"✅ تم الشراء!\n📦 {name}\n👛 {wallet_addr[:6]}...\n🔢 {result.get('quantity', 1)} قطعة"
-                    await asyncio.to_thread(
-                        requests.post,
-                        f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                        data={"chat_id": chat_id, "text": msg},
-                        timeout=5,
-                    )
-                except:
-                    pass
+            msg = build_purchase_message(item.get("current_detail", {}), res, item.get("chain_key", ""))
+            enqueue_message(bot_token, chat_id, msg)
+            log.info(f"✅ شراء ناجح للمحفظة {wallet_addr[:8]}... - {slug}")
         else:
-            log.warning(f"❌ فشل شراء للمحفظة {wallet_addr[:8]}...: {result.get('reason', 'unknown')}")
-        
-        return result
+            log.warning(f"❌ فشل شراء للمحفظة {wallet_addr[:8]}... - {slug}: {res.get('reason', 'unknown')}")
 
-async def try_buy(slug: str, chain_key: str, detail: dict):
-    """محاولة الشراء"""
+        return res
+
+async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict, price_wei: int = None):
+    """
+    محاولة الشراء - تبحث في جميع المراحل عن المرحلة المجانية
+    """
+    log.info(f"🛒 محاولة شراء {slug}")
     
-    # الحصول على المرحلة المجانية
-    free_stage = get_free_stage(detail)
-    if not free_stage:
-        log.info(f"⏳ '{slug}' لا توجد مرحلة مجانية")
+    # ✅ البحث عن المرحلة المجانية
+    target_price_wei = None
+    target_max_per_wallet = None
+    
+    # 1. استخدم السعر المحدد إذا تم تمريره
+    if price_wei is not None:
+        eth_price_usd = get_eth_price_usd()
+        if is_free_or_negligible(price_wei, eth_price_usd):
+            target_price_wei = price_wei
+            log.info(f"✅ استخدام السعر المحدد: {price_wei} wei")
+    
+    # 2. البحث عن مرحلة مجانية في التفاصيل
+    if target_price_wei is None:
+        free_stage = get_free_stage_from_detail(detail)
+        if free_stage:
+            target_price_wei = free_stage["price_wei"]
+            target_max_per_wallet = free_stage.get("max_per_wallet")
+            log.info(f"✅ استخدام سعر المرحلة المجانية: {target_price_wei} wei")
+    
+    # 3. إذا لم نجد مرحلة مجانية، توقف
+    if target_price_wei is None:
+        log.info(f"💰 '{slug}' لا توجد مرحلة مجانية")
         return None
-    
-    if free_stage["status"] == "imminent":
-        log.info(f"⏳ '{slug}' مرحلة مجانية قادمة - انتظار")
-        return None
-    
-    price_wei = free_stage["price_wei"]
-    max_per_wallet = free_stage.get("max_per_wallet")
-    
-    # فحص الكمية المتبقية
+
     max_supply = int(detail.get("max_supply") or 0)
     total_supply = int(detail.get("total_supply") or 0)
     remaining = max_supply - total_supply
-    
     if remaining <= 0:
         log.info(f"❌ '{slug}' نفدت الكمية")
-        return None
-    
+        return [{"success": False, "reason": "sold_out"}]
+
     contract_address = detail.get("contract_address")
     if not contract_address:
         log.warning(f"⚠️ '{slug}' لا يوجد عنوان عقد")
-        return None
-    
-    w3 = W3_INSTANCES.get(chain_key)
-    if not w3:
-        return None
-    
+        return [{"success": False, "reason": "no_contract_address"}]
+
+    w3 = W3_INSTANCES[chain_key]
     eth_price_usd = get_eth_price_usd()
-    
-    # التحقق من المجانية
-    if not is_free_or_negligible(price_wei, eth_price_usd):
-        price_usd = (price_wei / 1e18) * eth_price_usd
+
+    # شرط المجانية فقط
+    if not is_free_or_negligible(target_price_wei, eth_price_usd):
+        price_usd = (target_price_wei / 1e18) * eth_price_usd
         log.info(f"💰 '{slug}' مدفوع - ${price_usd:.6f}")
         return None
-    
-    # المحافظ التي لم تشترِ بعد
-    bought_wallets = successful_mints.get(slug, set())
-    pending_wallets = [w for w in WALLETS_DATA if w["wallet"] not in bought_wallets]
-    
-    if not pending_wallets:
+
+    max_gas_fee_usd = CHAIN_CONFIGS[chain_key]["max_gas_fee_usd"]
+
+    already_bought_wallets = successful_mints.get(slug, set())
+    pending_items = [item for item in WALLETS_DATA if item["wallet"] not in already_bought_wallets]
+
+    if not pending_items:
         log.info(f"✅ جميع المحافظ اشتريت لـ '{slug}'")
-        return None
-    
-    log.info(f"🛒 شراء {slug} لـ {len(pending_wallets)} محافظ")
-    
-    # شراء لكل محفظة
+        return [{"success": False, "reason": "all_wallets_completed"}]
+
+    log.info(f"🛒 بدء الشراء لـ {slug} - {len(pending_items)} محافظ متبقية")
+
+    for item in pending_items:
+        item["current_detail"] = detail
+        item["chain_key"] = chain_key
+
     tasks = [
-        buy_for_wallet(w3, w, slug, contract_address, price_wei, max_per_wallet, remaining, eth_price_usd)
-        for w in pending_wallets
+        purchase_task_for_wallet(
+            w3, item, slug, contract_address,
+            target_price_wei, target_max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
+        )
+        for item in pending_items
     ]
-    
+
     results = await asyncio.gather(*tasks)
     success_count = sum(1 for r in results if r.get("success"))
-    log.info(f"📊 تم شراء {success_count} من {len(results)} لمحفظة لـ '{slug}'")
+    log.info(f"📊 تم شراء {success_count} من {len(results)} محافظ لـ '{slug}'")
     
     return results
 
-# ==================== معالجة المينتات ====================
+# ---------------------------------------------------------------------------
+# تقييم شامل للمينتات - يكتشف جميع المراحل
+# ---------------------------------------------------------------------------
 
-async def process_mint(slug: str, chain_key: str):
-    """معالجة مينت جديد"""
-    
-    if slug in in_flight:
-        return
-    
-    if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
-        return
-    
-    in_flight.add(slug)
-    
-    try:
-        log.info(f"🔍 معالجة: {slug}")
-        
-        # جلب التفاصيل
-        detail = await asyncio.to_thread(fetch_drop_detail, slug)
-        if not detail:
-            log.warning(f"❌ لا توجد تفاصيل لـ {slug}")
-            in_flight.discard(slug)
+async def evaluate_new_mint_fast(slug: str, chain_key: str):
+    """تقييم شامل - يكتشف جميع المراحل (Team, Allowlist, Public)"""
+    async with semaphore:
+        if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
             return
         
-        # تسجيل المينت
-        if slug not in discovered_mints:
-            discovered_mints.add(slug)
-            log.info(f"🆕 مينت جديد: {slug}")
+        if slug in in_flight:
+            return
         
-        # التحقق من Twitter
-        twitter_username = get_cached_twitter(slug)
-        if twitter_username is None:
-            try:
-                twitter_username = await asyncio.to_thread(
-                    get_twitter_username_from_opensea,
-                    slug,
-                    OPENSEA_API_KEY
+        if is_in_cooldown(slug):
+            return
+
+        in_flight.add(slug)
+        try:
+            log.info(f"🔍 تقييم المينت: {slug}")
+            
+            found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
+            if not found or not detail:
+                log.warning(f"❌ لا توجد تفاصيل لـ {slug}")
+                in_flight.discard(slug)
+                return
+
+            # ✅ تحليل شامل لجميع المراحل
+            analysis = analyze_all_stages(slug, detail)
+            
+            if slug not in discovered_mints:
+                log.info(f"🆕 مينت جديد: {slug} [Ink]")
+                log.info(f"   📋 عدد المراحل: {analysis['total_stages']}")
+                
+                # عرض تفاصيل المراحل
+                for stage in analysis['all_stages']:
+                    if stage['status'] == 'past':
+                        continue
+                    status_text = "🟢 نشطة" if stage['status'] == 'active' else "⏳ قادمة"
+                    if stage.get('status') == 'imminent':
+                        status_text = "🔴 وشك"
+                    price_text = "مجاني" if stage['is_free'] else f"${stage['price_usd']:.4f}"
+                    eligible_text = "✅ مؤهل" if stage.get('is_eligible', True) else "❌ غير مؤهل"
+                    log.info(f"   📌 {stage['name']} | {status_text} | {price_text} | {eligible_text}")
+                
+                discovered_mints.add(slug)
+                bot_stats["mints_detected"] += 1
+
+            # ✅ الحفاظ على شرط Twitter - الشراء يتم فوراً إذا كان لديه حساب X
+            twitter_username = get_cached_twitter(slug)
+            if twitter_username is None:
+                try:
+                    twitter_username = await asyncio.to_thread(
+                        get_twitter_username_from_opensea, 
+                        slug, 
+                        OPENSEA_API_KEY
+                    )
+                    set_cached_twitter(slug, twitter_username)
+                except Exception as e:
+                    log.debug(f"خطأ في جلب تويتر لـ {slug}: {e}")
+                    twitter_username = None
+            
+            # رفض إذا لم يكن لديه حساب X
+            if twitter_username is None:
+                log.info(f"❌ '{slug}' مرفوض - لا يوجد حساب X")
+                mark_rejected(slug)
+                in_flight.discard(slug)
+                return
+
+            log.info(f"✅ '{slug}' يوجد حساب X: @{twitter_username}")
+
+            # ✅ البحث عن مرحلة مجانية
+            free_stage = get_free_stage_from_detail(detail)
+            
+            if free_stage:
+                log.info(f"🟢 '{slug}' لديه مرحلة مجانية - جارٍ الشراء...")
+                results = await try_buy_now_multi_wallet(
+                    slug, chain_key, detail, free_stage['price_wei']
                 )
-                set_cached_twitter(slug, twitter_username)
-            except:
-                pass
-        
-        if twitter_username is None:
-            log.info(f"❌ '{slug}' لا يوجد حساب X")
+                
+                if results is None:
+                    watchlist[slug] = {"chain_key": chain_key, "detail": detail}
+                elif len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
+                    watchlist[slug] = {"chain_key": chain_key, "detail": detail}
+            
+            # ✅ إذا كانت هناك مرحلة مجانية قادمة → تتبع
+            elif analysis['has_free_upcoming']:
+                next_free = analysis['next_free_stage']
+                if next_free:
+                    time_until = next_free.get('time_until_start', float('inf'))
+                    log.info(f"⏳ '{slug}' سيكون مجانياً في مرحلة {next_free['name']} خلال {time_until:.1f} ثانية")
+                    paid_mints_tracking[slug] = {
+                        "chain_key": chain_key,
+                        "detail": detail,
+                        "first_seen": time.time(),
+                        "last_check": time.time(),
+                        "check_count": 0,
+                        "analysis": analysis,
+                        "next_free_stage": next_free
+                    }
+            
+            # ✅ لا توجد مرحلة مجانية → تتبع للمستقبل
+            else:
+                log.info(f"💰 '{slug}' لا توجد مرحلة مجانية حالياً - جارٍ التتبع للمستقبل")
+                paid_mints_tracking[slug] = {
+                    "chain_key": chain_key,
+                    "detail": detail,
+                    "first_seen": time.time(),
+                    "last_check": time.time(),
+                    "check_count": 0,
+                    "analysis": analysis,
+                    "next_free_stage": None
+                }
+
+        except Exception as e:
+            log.error(f"خطأ بتقييم '{slug}': {e}")
+            bot_stats["errors"] += 1
+        finally:
             in_flight.discard(slug)
-            return
-        
-        # محاولة الشراء
-        await try_buy(slug, chain_key, detail)
-        
-    except Exception as e:
-        log.error(f"خطأ في معالجة '{slug}': {e}")
-    finally:
-        in_flight.discard(slug)
 
-# ==================== الفحص الدوري ====================
+# ---------------------------------------------------------------------------
+# فحص المينتات المدفوعة
+# ---------------------------------------------------------------------------
 
-async def periodic_scan():
-    """فحص دوري للمينتات المكتشفة"""
+async def scan_paid_mints():
     while True:
-        await asyncio.sleep(CHECK_INTERVAL)
-        
-        for slug in list(discovered_mints):
-            if slug in in_flight:
+        try:
+            await asyncio.sleep(PAID_MINTS_CHECK_INTERVAL)
+            
+            if not paid_mints_tracking:
                 continue
-            if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
+            
+            for slug, data in list(paid_mints_tracking.items()):
+                data['check_count'] = data.get('check_count', 0) + 1
+                data['last_check'] = time.time()
+                
+                if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
+                    paid_mints_tracking.pop(slug, None)
+                    continue
+                
+                found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
+                if not found:
+                    continue
+                
+                # ✅ تحليل شامل للمراحل
+                analysis = analyze_all_stages(slug, fresh_detail)
+                
+                # ✅ البحث عن مرحلة مجانية
+                free_stage = get_free_stage_from_detail(fresh_detail)
+                
+                if free_stage:
+                    wait_time = time.time() - data.get('first_seen', time.time())
+                    log.info(f"🔄 '{slug}' أصبح مجانياً بعد {wait_time:.0f} ثانية!")
+                    
+                    chain_key = data.get("chain_key", "ink")
+                    results = await try_buy_now_multi_wallet(
+                        slug, chain_key, fresh_detail, free_stage['price_wei']
+                    )
+                    
+                    if results and len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
+                        watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
+                    
+                    paid_mints_tracking.pop(slug, None)
+                else:
+                    # ✅ تحديث البيانات
+                    paid_mints_tracking[slug] = {
+                        "chain_key": data.get("chain_key", "ink"),
+                        "detail": fresh_detail,
+                        "first_seen": data.get("first_seen", time.time()),
+                        "last_check": time.time(),
+                        "check_count": data.get("check_count", 0),
+                        "analysis": analysis,
+                        "next_free_stage": analysis.get('next_free_stage')
+                    }
+            
+            # ✅ إزالة المينتات القديمة
+            now = time.time()
+            expired = []
+            for slug, data in paid_mints_tracking.items():
+                if now - data.get('first_seen', now) > PAID_MINTS_EXPIRY_SECONDS:
+                    expired.append(slug)
+            
+            for slug in expired:
+                paid_mints_tracking.pop(slug, None)
+                log.info(f"🗑️ إزالة '{slug}' من التتبع (انتهت المدة)")
+                        
+        except Exception as e:
+            log.error(f"خطأ في فحص المينتات المدفوعة: {e}")
+            bot_stats["errors"] += 1
+            await asyncio.sleep(0.5)
+
+# ---------------------------------------------------------------------------
+# الفحص الدوري للمينتات المكتشفة
+# ---------------------------------------------------------------------------
+
+async def check_all_discovered_mints():
+    """فحص دوري لجميع المينتات المكتشفة للتأكد من عدم تفويت أي فرصة"""
+    while True:
+        try:
+            await asyncio.sleep(DISCOVERED_MINTS_CHECK_INTERVAL)
+            
+            if not discovered_mints:
                 continue
-            asyncio.create_task(process_mint(slug, "ink"))
+            
+            for slug in list(discovered_mints):
+                # تجاهل المينتات التي اكتمل شراؤها
+                if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
+                    continue
+                
+                # تجاهل المينتات المرفوضة مؤخراً
+                if is_in_cooldown(slug):
+                    continue
+                
+                # تجاهل المينتات قيد المعالجة
+                if slug in in_flight:
+                    continue
+                
+                found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
+                if not found or not detail:
+                    continue
+                
+                analysis = analyze_all_stages(slug, detail)
+                
+                # ✅ البحث عن مرحلة مجانية
+                free_stage = get_free_stage_from_detail(detail)
+                
+                if free_stage:
+                    log.info(f"🟢 '{slug}' لديه مرحلة مجانية الآن!")
+                    
+                    chain_key = "ink"
+                    
+                    # الحفاظ على شرط Twitter
+                    twitter_username = get_cached_twitter(slug)
+                    if twitter_username is None:
+                        try:
+                            twitter_username = await asyncio.to_thread(
+                                get_twitter_username_from_opensea, 
+                                slug, 
+                                OPENSEA_API_KEY
+                            )
+                            set_cached_twitter(slug, twitter_username)
+                        except Exception as e:
+                            log.debug(f"خطأ في جلب تويتر لـ {slug}: {e}")
+                            twitter_username = None
+                    
+                    if twitter_username is None:
+                        log.info(f"❌ '{slug}' لا يوجد حساب X - تخطي")
+                        mark_rejected(slug)
+                        continue
+                    
+                    results = await try_buy_now_multi_wallet(
+                        slug, chain_key, detail, free_stage['price_wei']
+                    )
+                    
+                    if results and len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
+                        watchlist[slug] = {"chain_key": chain_key, "detail": detail}
+                
+                # ✅ إذا كانت هناك مرحلة مجانية قادمة
+                elif analysis['has_free_upcoming']:
+                    paid_mints_tracking[slug] = {
+                        "chain_key": "ink",
+                        "detail": detail,
+                        "first_seen": time.time(),
+                        "last_check": time.time(),
+                        "check_count": 0,
+                        "analysis": analysis,
+                        "next_free_stage": analysis['next_free_stage']
+                    }
+                        
+        except Exception as e:
+            log.error(f"خطأ في الفحص الدوري: {e}")
+            bot_stats["errors"] += 1
+            await asyncio.sleep(0.5)
 
-# ==================== الاستماع إلى OpenSea ====================
+# ---------------------------------------------------------------------------
+# watch_loop
+# ---------------------------------------------------------------------------
 
-async def listen_opensea():
-    """الاستماع إلى أحداث OpenSea"""
+async def watch_loop():
+    while True:
+        await asyncio.sleep(WATCH_POLL_INTERVAL_SECONDS)
+        if not watchlist:
+            continue
+
+        for slug in list(watchlist.keys()):
+            if slug in in_flight or len(successful_mints.get(slug, set())) >= len(WALLETS_DATA):
+                watchlist.pop(slug, None)
+                continue
+
+            entry = watchlist.get(slug)
+            if not entry:
+                continue
+
+            in_flight.add(slug)
+            try:
+                chain_key = entry["chain_key"]
+                found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
+
+                if not found or not fresh_detail:
+                    watchlist.pop(slug, None)
+                    continue
+
+                # ✅ تحليل شامل للمراحل
+                analysis = analyze_all_stages(slug, fresh_detail)
+                
+                # ✅ البحث عن مرحلة مجانية
+                free_stage = get_free_stage_from_detail(fresh_detail)
+                
+                if not free_stage:
+                    if analysis['has_free_upcoming']:
+                        paid_mints_tracking[slug] = {
+                            "chain_key": chain_key,
+                            "detail": fresh_detail,
+                            "first_seen": time.time(),
+                            "last_check": time.time(),
+                            "check_count": 0,
+                            "analysis": analysis,
+                            "next_free_stage": analysis['next_free_stage']
+                        }
+                    watchlist.pop(slug, None)
+                    continue
+
+                results = await try_buy_now_multi_wallet(slug, chain_key, fresh_detail, free_stage['price_wei'])
+
+                if results is None:
+                    watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
+                    continue
+
+                if len(successful_mints.get(slug, set())) >= len(WALLETS_DATA):
+                    watchlist.pop(slug, None)
+                else:
+                    watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
+
+            except Exception as e:
+                log.error(f"خطأ بدورة مراقبة '{slug}': {e}")
+                bot_stats["errors"] += 1
+            finally:
+                in_flight.discard(slug)
+
+# ---------------------------------------------------------------------------
+# الاستماع الشامل إلى OpenSea
+# ---------------------------------------------------------------------------
+
+async def listen_opensea_fast():
+    msg_ref = 0
+    recent_mints = {}
+    RECENT_WINDOW = 1  # ✅ تقليل إلى 1 ثانية
     reconnect_attempts = 0
     
     while True:
         try:
-            log.info(f"🔄 الاتصال بـ OpenSea... (محاولة #{reconnect_attempts + 1})")
+            log.info(f"🔄 محاولة الاتصال بـ OpenSea Stream... (محاولة #{reconnect_attempts + 1})")
             
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=10) as ws:
-                log.info("✅ تم الاتصال بـ OpenSea")
-                log.info(f"🚀 مراقبة {len(WALLETS_DATA)} محافظ")
+                log.info(f"✅ تم الاتصال بـ OpenSea Stream بنجاح!")
+                log.info(f"🚀 اكتشاف شامل لـ {len(WALLETS_DATA)} محافظ على Ink.")
                 
-                # الاشتراك
-                msg_ref = 0
-                join_msg = json.dumps([str(msg_ref), str(msg_ref), "collection:*", "phx_join", {}])
-                await ws.send(join_msg)
+                # ✅ الاشتراك في جميع المجموعات
+                join_ref = str(msg_ref)
+                subscribe_msg = json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}])
+                await ws.send(subscribe_msg)
+                log.info(f"📡 تم الاشتراك في جميع المجموعات")
                 msg_ref += 1
                 
-                for event in ["item_transferred", "item_listed", "collection_created"]:
-                    event_msg = json.dumps([str(msg_ref), str(msg_ref), f"collection:*:{event}", "phx_join", {}])
+                # ✅ الاشتراك في الأحداث المحددة
+                for event in ["item_transferred", "item_listed", "collection_created", "item_sold", "item_metadata_updated"]:
+                    event_ref = str(msg_ref)
+                    event_msg = json.dumps([event_ref, event_ref, f"collection:*:{event}", "phx_join", {}])
                     await ws.send(event_msg)
                     msg_ref += 1
                 
                 last_heartbeat = time.time()
-                events_count = 0
-                
+                last_event_time = time.time()
+                events_received = 0
+
                 while True:
-                    # Heartbeat
-                    if time.time() - last_heartbeat > 20:
-                        await ws.send(json.dumps([None, str(msg_ref), "phoenix", "heartbeat", {}]))
+                    # ✅ إرسال heartbeat
+                    if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
+                        hb_ref = str(msg_ref)
+                        await ws.send(json.dumps([None, hb_ref, "phoenix", "heartbeat", {}]))
                         msg_ref += 1
                         last_heartbeat = time.time()
-                    
+                        
+                        # ✅ تحذير إذا لم تصل أحداث لفترة طويلة
+                        if time.time() - last_event_time > 45:
+                            log.warning(f"⚠️ لم تصل أي أحداث منذ {int(time.time() - last_event_time)} ثانية")
+                            log.info("🔄 إعادة الاتصال بسبب عدم وجود أحداث...")
+                            break
+
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                        raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT)
                     except asyncio.TimeoutError:
                         continue
-                    except websockets.ConnectionClosed:
+                    except websockets.ConnectionClosed as e:
+                        log.warning(f"⚠️ تم إغلاق الاتصال: {e}")
                         break
-                    
+
                     try:
                         parsed = json.loads(raw)
-                    except:
+                    except json.JSONDecodeError as e:
+                        log.warning(f"⚠️ فشل تحليل JSON: {e}")
                         continue
-                    
+
+                    # ✅ تحقق من نوع الرسالة
                     if isinstance(parsed, list) and len(parsed) >= 4:
-                        event_name = parsed[3]
-                        events_count += 1
+                        _jref, _ref, topic, event_name = parsed[:4]
+                        payload_wrapper = parsed[4] if len(parsed) > 4 else {}
                         
-                        if events_count <= 5:
-                            log.info(f"📨 حدث #{events_count}: {event_name}")
+                        # ✅ تسجيل جميع الأحداث القادمة
+                        events_received += 1
+                        last_event_time = time.time()
+                        bot_stats["events_received"] += 1
                         
-                        # استخراج slug
-                        payload = parsed[4] if len(parsed) > 4 else {}
-                        payload = payload.get("payload", {}) if isinstance(payload, dict) else {}
+                        if events_received <= 5:
+                            log.info(f"📨 حدث #{events_received}: {event_name}")
                         
-                        collection = payload.get("collection", {})
-                        if isinstance(collection, dict):
-                            slug = collection.get("slug")
-                        else:
-                            slug = None
+                        # ✅ قبول جميع الأحداث المتعلقة بالمجموعات
+                        accepted_events = [
+                            "item_transferred", 
+                            "item_listed", 
+                            "collection_created", 
+                            "item_received", 
+                            "item_sold",
+                            "item_metadata_updated",
+                            "collection_updated",
+                            "item_cancelled",
+                            "item_offered",
+                            "collection_offer_created"
+                        ]
+                        
+                        if event_name not in accepted_events:
+                            continue
+
+                        # ✅ استخراج البيانات
+                        payload = (payload_wrapper or {}).get("payload") or {}
+                        
+                        # ✅ محاولة استخراج معلومات المجموعة بطرق مختلفة
+                        collection_info = payload.get("collection", {}) or {}
+                        item = payload.get("item", {}) or {}
+                        
+                        slug = collection_info.get("slug", "")
+                        
+                        # ✅ إذا لم نجد slug في collection، نحاول من item
+                        if not slug:
+                            collection_from_item = item.get("collection", {}) or {}
+                            slug = collection_from_item.get("slug", "")
                         
                         if not slug:
-                            item = payload.get("item", {})
-                            if isinstance(item, dict):
-                                collection = item.get("collection", {})
-                                if isinstance(collection, dict):
-                                    slug = collection.get("slug")
+                            continue
                         
-                        if slug:
-                            log.info(f"🎯 اكتشاف: {slug}")
-                            asyncio.create_task(process_mint(slug, "ink"))
+                        # ✅ استخراج اسم السلسلة
+                        stream_chain_name = ""
+                        chain_info = item.get("chain", {}) or {}
+                        stream_chain_name = chain_info.get("name", "")
+                        
+                        # ✅ إذا لم نجد السلسلة في item، نحاول من collection
+                        if not stream_chain_name:
+                            chain_info = collection_info.get("chain", {}) or {}
+                            stream_chain_name = chain_info.get("name", "")
+                        
+                        chain_key = STREAM_NAME_TO_CHAIN_KEY.get(stream_chain_name)
+                        
+                        if chain_key is None:
+                            continue
+                        
+                        # فقط Ink
+                        if chain_key != "ink":
+                            continue
+
+                        # ✅ تسجيل اكتشاف مينت جديد
+                        log.info(f"🎯 اكتشاف مينت على Ink: {slug} (حدث: {event_name})")
+                        
+                        # منع التكرار
+                        now = time.time()
+                        if slug in recent_mints:
+                            if now - recent_mints[slug] < RECENT_WINDOW:
+                                continue
+                        recent_mints[slug] = now
+
+                        # تنظيف الذاكرة
+                        for s in list(recent_mints.keys()):
+                            if now - recent_mints[s] > 30:
+                                del recent_mints[s]
+
+                        log.info(f"📨 معالجة حدث: {event_name} → {slug} على {chain_key}")
+                        asyncio.create_task(evaluate_new_mint_fast(slug, chain_key))
                     
-            reconnect_attempts = 0
-            
+                    elif isinstance(parsed, dict):
+                        # ✅ رسائل التحكم
+                        if events_received <= 3:
+                            log.info(f"📨 رسالة تحكم: {parsed.get('event', 'unknown')}")
+
+        except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+            reconnect_attempts += 1
+            log.warning(f"⚠️ انقطع الاتصال ({e}). إعادة الاتصال خلال 1 ثانية... (محاولة #{reconnect_attempts})")
+            await asyncio.sleep(1)
         except Exception as e:
             reconnect_attempts += 1
-            log.warning(f"⚠️ انقطع الاتصال: {e}")
+            log.error(f"❌ خطأ غير متوقع: {e}")
+            bot_stats["errors"] += 1
             await asyncio.sleep(2)
+        else:
+            reconnect_attempts = 0
 
-# ==================== التشغيل ====================
+# ==================== التشغيل الرئيسي ====================
 
 async def run():
     if not BOT_ENABLED:
         log.warning("🔴 BOT_ENABLED=false")
+        broadcast_message("🔴 البوت في وضع الإيقاف (BOT_ENABLED=false).")
+        await telegram_sender()
         return
+
+    broadcast_message(build_startup_message())
+    log.info("🚀 تم تشغيل البوت بنجاح - اكتشاف شامل لجميع المراحل!")
     
-    log.info("🚀 تم تشغيل البوت!")
-    log.info(f"📊 عدد المحافظ: {len(WALLETS_DATA)}")
-    log.info("💰 المينتات: مجانية فقط")
+    await asyncio.sleep(2)
+    await test_telegram()
     
     await asyncio.gather(
-        listen_opensea(),
-        periodic_scan(),
+        listen_opensea_fast(),
+        scan_paid_mints(),
+        check_all_discovered_mints(),
+        watch_loop(),
+        telegram_sender()
     )
 
 def main():
+    backoff = 2
     while True:
         try:
             asyncio.run(run())
@@ -508,10 +1235,13 @@ def main():
             log.info("تم الإيقاف يدوياً.")
             break
         except Exception as e:
-            log.critical(f"توقف: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(5)
+            log.critical(f"توقف غير متوقع: {e}.")
+            bot_stats["errors"] += 1
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+            continue
+        else:
+            break
 
 if __name__ == "__main__":
     main()
