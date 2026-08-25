@@ -61,12 +61,14 @@ FEW_THRESHOLD = 20
 LIMITED_BUY_QTY = 15
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 
-# ✅ تحسين نظام إعادة المحاولة
-MAX_RETRY_ATTEMPTS = 5  # زيادة عدد المحاولات
-BASE_RETRY_DELAY = 1  # تأخير أساسي
-MAX_RETRY_DELAY = 10  # أقصى تأخير
+# ✅ إعدادات إعادة المحاولة المحسنة
+MAX_RETRY_ATTEMPTS = 5
+BASE_RETRY_DELAY = 0.5  # ✅ تقليل للتسريع
+MAX_RETRY_DELAY = 8
 
-# ✅ تصنيف الأخطاء
+# ✅ تخزين المعاملات المحضرة عالمياً
+prepared_transactions = {}
+
 ERROR_CATEGORIES = {
     "fatal": ["sold_out", "already_minted", "invalid_address", "contract_paused"],
     "retryable": ["nonce_issue", "gas_issue", "network_error", "timeout"],
@@ -141,14 +143,12 @@ def get_onchain_public_price_wei(w3: Web3, nft_contract: str):
         log.warning(f"[سعر on-chain] تعذر القراءة للعقد {nft_contract[:8]}...: {e}")
         return None
 
-# ✅ تحسين تحليل الأخطاء
 def analyze_error(error: Exception) -> dict:
     """
     تحليل ذكي للأخطاء مع تصنيفها وتحديد ما إذا كانت قابلة لإعادة المحاولة
     """
     error_str = str(error).lower()
     
-    # ✅ تحليل مفصل للأخطاء
     error_patterns = {
         "insufficient_funds": {
             "keywords": ["insufficient funds", "insufficient balance", "not enough funds", "insufficient eth"],
@@ -230,7 +230,6 @@ def analyze_error(error: Exception) -> dict:
         },
     }
     
-    # ✅ البحث عن الخطأ المناسب
     for error_name, error_info in error_patterns.items():
         for keyword in error_info["keywords"]:
             if keyword in error_str:
@@ -239,43 +238,37 @@ def analyze_error(error: Exception) -> dict:
                     "category": error_info["category"],
                     "retryable": error_info["retryable"],
                     "action": error_info["action"],
-                    "message": error_str[:200],  # تحديد طول الرسالة
+                    "message": error_str[:200],
                     "original_error": error
                 }
     
-    # ✅ إذا لم يتم العثور على تطابق
     return {
         "reason": "unknown_error",
         "category": "unknown",
-        "retryable": True,  # افتراضياً قابلة للمحاولة
+        "retryable": True,
         "action": "retry_with_backoff",
         "message": error_str[:200],
         "original_error": error
     }
 
-# ✅ حساب التأخير الذكي
 def calculate_retry_delay(attempt: int, error_analysis: dict) -> float:
     """
     حساب تأخير ذكي بناءً على نوع الخطأ وعدد المحاولات
     """
     base_delay = BASE_RETRY_DELAY
     
-    # ✅ تأخير أطول للأخطاء الشبكية
     if error_analysis["reason"] in ["network_error", "rpc_error", "timeout"]:
-        base_delay = 2
+        base_delay = 1
     
-    # ✅ تأخير أقصر لمشاكل nonce
     if error_analysis["reason"] in ["nonce_too_low", "nonce_too_high"]:
-        base_delay = 0.5
+        base_delay = 0.3
     
-    # ✅ زيادة تدريجية مع إضافة عشوائية
-    exponential_delay = base_delay * (2 ** attempt)
-    jitter = random.uniform(0, 0.5)  # عشوائية لتجنب التزامن
+    exponential_delay = base_delay * (1.5 ** attempt)
+    jitter = random.uniform(0, 0.3)
     
     return min(exponential_delay + jitter, MAX_RETRY_DELAY)
 
-# ✅ التحقق من نجاح المعاملة
-def wait_for_transaction_receipt(w3: Web3, tx_hash: str, timeout: int = 60) -> dict:
+def wait_for_transaction_receipt(w3: Web3, tx_hash: str, timeout: int = 45) -> dict:
     """
     انتظار تأكيد المعاملة مع مهلة زمنية
     """
@@ -296,7 +289,7 @@ def wait_for_transaction_receipt(w3: Web3, tx_hash: str, timeout: int = 60) -> d
         except Exception as e:
             log.warning(f"[الاستلام] خطأ في انتظار الاستلام: {e}")
         
-        time.sleep(1)
+        time.sleep(0.5)  # ✅ تقليل وقت الانتظار
     
     return {
         "success": False,
@@ -304,7 +297,322 @@ def wait_for_transaction_receipt(w3: Web3, tx_hash: str, timeout: int = 60) -> d
         "error": "timeout"
     }
 
-# ✅ دالة الشراء المحسنة
+# ==================== دالة تحضير المعاملات مسبقاً ====================
+
+def prepare_transaction_for_wallet(
+    w3: Web3,
+    wallet_address: str,
+    nft_contract: str,
+    price_wei: int,
+    max_per_wallet,
+    remaining_supply: int,
+    chain_id: int,
+) -> dict:
+    """
+    تحضير معاملة مسبقاً لمحفظة معينة
+    """
+    try:
+        checksum_wallet = Web3.to_checksum_address(wallet_address)
+        checksum_contract = Web3.to_checksum_address(nft_contract)
+        
+        # ✅ الحصول على مستفيد الرسوم
+        fee_recipient = get_fee_recipient(w3, checksum_contract)
+        if not fee_recipient:
+            fee_recipient = ZERO_ADDRESS
+        
+        # ✅ تحديد الكمية
+        quantity = decide_quantity(max_per_wallet, remaining_supply)
+        total_value = price_wei * quantity
+        
+        # ✅ بناء المعاملة
+        contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+        nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
+        
+        tx = contract.functions.mintPublic(
+            checksum_contract,
+            fee_recipient,
+            ZERO_ADDRESS,
+            quantity,
+        ).build_transaction({
+            "from": checksum_wallet,
+            "value": total_value,
+            "nonce": nonce,
+            "chainId": chain_id,
+        })
+        
+        # ✅ تقدير الغاز
+        try:
+            estimated_gas = w3.eth.estimate_gas(tx)
+            tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
+        except Exception as e:
+            log.warning(f"⚠️ فشل تقدير الغاز للمحفظة {wallet_address[:8]}...: {e}")
+            # ✅ استخدام قيمة افتراضية
+            tx["gas"] = 150_000
+        
+        return {
+            "success": True,
+            "tx": tx,
+            "quantity": quantity,
+            "total_value": total_value,
+            "fee_recipient": fee_recipient,
+            "prepared_at": time.time()
+        }
+        
+    except Exception as e:
+        log.error(f"❌ فشل تحضير المعاملة للمحفظة {wallet_address[:8]}...: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "wallet": wallet_address
+        }
+
+def prepare_all_transactions(
+    slug: str,
+    chain_key: str,
+    w3: Web3,
+    nft_contract: str,
+    price_wei: int,
+    max_per_wallet,
+    remaining_supply: int,
+    wallets_data: list,
+) -> dict:
+    """
+    تحضير معاملات لجميع المحافظ لمينت معين
+    """
+    global prepared_transactions
+    
+    chain_id = w3.eth.chain_id
+    results = {}
+    
+    for wallet_data in wallets_data:
+        wallet_addr = wallet_data["wallet"]
+        
+        # ✅ تخطي المحافظ التي اشترت بالفعل
+        if slug in prepared_transactions and wallet_addr in prepared_transactions[slug]:
+            continue
+        
+        result = prepare_transaction_for_wallet(
+            w3,
+            wallet_addr,
+            nft_contract,
+            price_wei,
+            max_per_wallet,
+            remaining_supply,
+            chain_id,
+        )
+        
+        if result["success"]:
+            if slug not in prepared_transactions:
+                prepared_transactions[slug] = {}
+            
+            prepared_transactions[slug][wallet_addr] = {
+                "tx": result["tx"],
+                "quantity": result["quantity"],
+                "total_value": result["total_value"],
+                "fee_recipient": result["fee_recipient"],
+                "prepared_at": result["prepared_at"],
+                "wallet_data": wallet_data,
+                "chain_key": chain_key
+            }
+            
+            results[wallet_addr] = {
+                "success": True,
+                "quantity": result["quantity"]
+            }
+            
+            log.info(f"📝 معاملة محضرة للمحفظة {wallet_addr[:8]}...: {result['quantity']} قطعة")
+        else:
+            results[wallet_addr] = {
+                "success": False,
+                "error": result.get("error", "unknown")
+            }
+    
+    return results
+
+def get_prepared_transaction(slug: str, wallet_address: str, w3: Web3 = None) -> dict:
+    """
+    الحصول على معاملة محضرة مع تحديث nonce وسعر الغاز
+    """
+    global prepared_transactions
+    
+    if slug not in prepared_transactions:
+        return None
+    
+    if wallet_address not in prepared_transactions[slug]:
+        return None
+    
+    prep = prepared_transactions[slug][wallet_address]
+    tx = prep["tx"].copy()
+    
+    # ✅ تحديث nonce
+    if w3:
+        try:
+            tx["nonce"] = w3.eth.get_transaction_count(wallet_address, "pending")
+        except:
+            pass
+        
+        # ✅ تحديث سعر الغاز
+        try:
+            tx["gasPrice"] = w3.eth.gas_price
+        except:
+            pass
+    
+    return {
+        "tx": tx,
+        "quantity": prep["quantity"],
+        "total_value": prep["total_value"],
+        "wallet_data": prep["wallet_data"],
+        "chain_key": prep.get("chain_key", "ink")
+    }
+
+def clear_prepared_transactions(slug: str = None, wallet_address: str = None):
+    """
+    تنظيف المعاملات المحضرة
+    """
+    global prepared_transactions
+    
+    if slug is None:
+        prepared_transactions = {}
+        return
+    
+    if slug in prepared_transactions:
+        if wallet_address is None:
+            del prepared_transactions[slug]
+        elif wallet_address in prepared_transactions[slug]:
+            del prepared_transactions[slug][wallet_address]
+            if not prepared_transactions[slug]:
+                del prepared_transactions[slug]
+
+# ==================== دالة الشراء المحسنة ====================
+
+def attempt_purchase_with_prepared_tx(
+    w3: Web3,
+    private_key: str,
+    wallet_address: str,
+    slug: str,
+    eth_price_usd: float,
+    max_gas_fee_usd: float,
+) -> dict:
+    """
+    محاولة الشراء باستخدام معاملة محضرة
+    """
+    try:
+        checksum_wallet = Web3.to_checksum_address(wallet_address)
+    except Exception as e:
+        log.error(f"[عنوان غير صالح] للمحفظة {wallet_address[:8]}...: {e}")
+        return {"success": False, "wallet": wallet_address, "reason": "invalid_address", "error": str(e)}
+    
+    # ✅ الحصول على المعاملة المحضرة
+    prep = get_prepared_transaction(slug, wallet_address, w3)
+    if not prep:
+        return {"success": False, "wallet": wallet_address, "reason": "no_prepared_tx"}
+    
+    tx = prep["tx"]
+    quantity = prep["quantity"]
+    
+    # ✅ فحص الرصيد
+    balance_usd = get_wallet_balance_usd(w3, checksum_wallet, eth_price_usd)
+    if balance_usd < MIN_BALANCE_RESERVE_USD:
+        log.warning(f"⚠️ رصيد منخفض للمحفظة {checksum_wallet[:8]}...: ${balance_usd:.4f}")
+        return {"success": False, "wallet": checksum_wallet, "reason": "balance_too_low", "balance_usd": balance_usd}
+    
+    # ✅ التحقق من التكلفة
+    try:
+        gas_price = w3.eth.gas_price
+        gas_fee_usd = (tx["gas"] * gas_price / 1e18) * eth_price_usd
+        
+        if gas_fee_usd > max_gas_fee_usd:
+            log.warning(f"⚠️ رسوم غاز مرتفعة للمحفظة {checksum_wallet[:8]}...: ${gas_fee_usd:.4f}")
+            return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd}
+        
+        total_cost_wei = prep["total_value"] + (tx["gas"] * gas_price)
+        wallet_balance_wei = w3.eth.get_balance(checksum_wallet)
+        
+        if wallet_balance_wei < total_cost_wei:
+            log.warning(f"⚠️ رصيد غير كافٍ للمحفظة {checksum_wallet[:8]}...")
+            return {"success": False, "wallet": checksum_wallet, "reason": "insufficient_funds_for_total_cost"}
+    except Exception as e:
+        log.error(f"❌ فشل التحقق من التكلفة: {e}")
+        return {"success": False, "wallet": checksum_wallet, "reason": "pre_send_check_failed", "error": str(e)}
+    
+    # ✅ إرسال المعاملة
+    for attempt in range(MAX_RETRY_ATTEMPTS):
+        try:
+            log.info(f"📤 محاولة {attempt + 1}/{MAX_RETRY_ATTEMPTS} لإرسال المعاملة المحضرة للمحفظة {checksum_wallet[:8]}...")
+            
+            # ✅ تحديث nonce قبل الإرسال
+            if attempt > 0:
+                tx["nonce"] = w3.eth.get_transaction_count(checksum_wallet, "pending")
+            
+            signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            
+            log.info(f"✅ تم إرسال المعاملة المحضرة للمحفظة {checksum_wallet[:8]}...: {tx_hash.hex()}")
+            
+            # ✅ انتظار التأكيد
+            receipt_result = wait_for_transaction_receipt(w3, tx_hash.hex())
+            
+            if receipt_result["success"]:
+                log.info(f"✅ شراء ناجح للمحفظة {checksum_wallet[:8]}...: {tx_hash.hex()} — كمية: {quantity}")
+                
+                # ✅ تنظيف المعاملة المحضرة
+                clear_prepared_transactions(slug, wallet_address)
+                
+                return {
+                    "success": True,
+                    "wallet": checksum_wallet,
+                    "tx_hash": tx_hash.hex(),
+                    "quantity": quantity,
+                    "gas_fee_usd": gas_fee_usd,
+                    "total_value_wei": prep["total_value"],
+                    "attempt": attempt + 1,
+                    "used_prepared": True,
+                    "gas_used": receipt_result.get("gas_used"),
+                    "block_number": receipt_result.get("block_number")
+                }
+            else:
+                log.warning(f"⚠️ المعاملة فشلت على السلسلة للمحفظة {checksum_wallet[:8]}...")
+                
+                if attempt < MAX_RETRY_ATTEMPTS - 1:
+                    delay = calculate_retry_delay(attempt, {"reason": "transaction_failed", "retryable": True})
+                    time.sleep(delay)
+                    continue
+                else:
+                    return {"success": False, "wallet": checksum_wallet, "reason": "transaction_failed", "error": "Transaction reverted on chain"}
+            
+        except ContractLogicError as e:
+            error_analysis = analyze_error(e)
+            
+            if error_analysis["category"] == "fatal":
+                return {"success": False, "wallet": checksum_wallet, "reason": error_analysis["reason"], "error": str(e), "analysis": error_analysis}
+            
+            if attempt < MAX_RETRY_ATTEMPTS - 1:
+                delay = calculate_retry_delay(attempt, error_analysis)
+                time.sleep(delay)
+                continue
+            else:
+                return {"success": False, "wallet": checksum_wallet, "reason": error_analysis["reason"], "error": str(e), "analysis": error_analysis}
+            
+        except Exception as e:
+            error_analysis = analyze_error(e)
+            
+            if not error_analysis["retryable"]:
+                return {"success": False, "wallet": checksum_wallet, "reason": error_analysis["reason"], "error": str(e), "analysis": error_analysis}
+            
+            if attempt < MAX_RETRY_ATTEMPTS - 1:
+                delay = calculate_retry_delay(attempt, error_analysis)
+                time.sleep(delay)
+                continue
+            else:
+                return {"success": False, "wallet": checksum_wallet, "reason": error_analysis["reason"], "error": str(e), "analysis": error_analysis}
+    
+    return {
+        "success": False,
+        "wallet": checksum_wallet,
+        "reason": "max_retries_exceeded",
+        "max_attempts": MAX_RETRY_ATTEMPTS
+    }
+
 def attempt_purchase_single_wallet(
     w3: Web3,
     private_key: str,
@@ -317,7 +625,7 @@ def attempt_purchase_single_wallet(
     max_gas_fee_usd: float,
 ) -> dict:
     """
-    محاولة الشراء مع نظام ذكي لإعادة المحاولة
+    محاولة الشراء بالطريقة العادية (بدون معاملة محضرة)
     """
     try:
         checksum_wallet = Web3.to_checksum_address(wallet_address)
@@ -326,31 +634,25 @@ def attempt_purchase_single_wallet(
         log.error(f"[عنوان غير صالح] للمحفظة {wallet_address[:8]}...: {e}")
         return {"success": False, "wallet": wallet_address, "reason": "invalid_address", "error": str(e)}
 
-    # ✅ فحص الرصيد
     balance_usd = get_wallet_balance_usd(w3, checksum_wallet, eth_price_usd)
     if balance_usd < MIN_BALANCE_RESERVE_USD:
         log.warning(f"⚠️ رصيد منخفض للمحفظة {checksum_wallet[:8]}...: ${balance_usd:.4f}")
         return {"success": False, "wallet": checksum_wallet, "reason": "balance_too_low", "balance_usd": balance_usd}
 
-    # ✅ فحص رسوم الغاز
     gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
     if gas_fee_usd > max_gas_fee_usd:
         log.warning(f"⚠️ رسوم غاز مرتفعة للمحفظة {checksum_wallet[:8]}...: ${gas_fee_usd:.4f}")
         return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd}
 
-    # ✅ الحصول على مستفيد الرسوم
     fee_recipient = get_fee_recipient(w3, checksum_contract)
     if not fee_recipient:
-        log.warning(f"⚠️ لا يوجد مستفيد للعقد {checksum_contract[:8]}... - استخدام عنوان الصفر")
         fee_recipient = ZERO_ADDRESS
 
-    # ✅ تحديد الكمية
     quantity = decide_quantity(max_per_wallet, remaining_supply)
     total_value = price_wei_per_token * quantity
     
     log.info(f"💰 محاولة شراء {quantity} من {checksum_contract[:8]}... للمحفظة {checksum_wallet[:8]}...")
 
-    # ✅ بناء المعاملة
     try:
         contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
@@ -371,7 +673,6 @@ def attempt_purchase_single_wallet(
         log.error(f"❌ فشل بناء المعاملة للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
         return {"success": False, "wallet": checksum_wallet, "reason": "build_tx_failed", "error": str(e), "analysis": error_analysis}
 
-    # ✅ تقدير الغاز مع تحليل الأخطاء
     try:
         estimated_gas = w3.eth.estimate_gas(tx)
         tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
@@ -380,7 +681,6 @@ def attempt_purchase_single_wallet(
         error_analysis = analyze_error(e)
         log.error(f"❌ فشل تقدير الغاز (منطق العقد) للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
         
-        # ✅ إذا كان الخطأ "phase_not_active" أو "not_eligible"، قد ننتظر
         if error_analysis["reason"] in ["phase_not_active", "not_eligible"]:
             return {"success": False, "wallet": checksum_wallet, "reason": f"contract_reverted_{error_analysis['reason']}", "error": str(e), "analysis": error_analysis}
         
@@ -390,7 +690,6 @@ def attempt_purchase_single_wallet(
         log.error(f"❌ فشل تقدير الغاز للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
         return {"success": False, "wallet": checksum_wallet, "reason": "gas_estimation_failed", "error": str(e), "analysis": error_analysis}
 
-    # ✅ التحقق من التكلفة
     try:
         gas_price = w3.eth.gas_price
         actual_gas_fee_usd = (tx["gas"] * gas_price / 1e18) * eth_price_usd
@@ -410,19 +709,18 @@ def attempt_purchase_single_wallet(
         log.error(f"❌ فشل التحقق من التكلفة للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
         return {"success": False, "wallet": checksum_wallet, "reason": "pre_send_check_failed", "error": str(e), "analysis": error_analysis}
 
-    # ✅ نظام إعادة المحاولة الذكي
-    consecutive_errors = 0
-    
     for attempt in range(MAX_RETRY_ATTEMPTS):
         try:
             log.info(f"📤 محاولة {attempt + 1}/{MAX_RETRY_ATTEMPTS} لإرسال المعاملة للمحفظة {checksum_wallet[:8]}...")
+            
+            if attempt > 0:
+                tx["nonce"] = w3.eth.get_transaction_count(checksum_wallet, "pending")
             
             signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
             
             log.info(f"✅ تم إرسال المعاملة للمحفظة {checksum_wallet[:8]}...: {tx_hash.hex()}")
             
-            # ✅ انتظار تأكيد المعاملة
             receipt_result = wait_for_transaction_receipt(w3, tx_hash.hex())
             
             if receipt_result["success"]:
@@ -435,17 +733,15 @@ def attempt_purchase_single_wallet(
                     "gas_fee_usd": actual_gas_fee_usd,
                     "total_value_wei": total_value,
                     "attempt": attempt + 1,
+                    "used_prepared": False,
                     "gas_used": receipt_result.get("gas_used"),
                     "block_number": receipt_result.get("block_number")
                 }
             else:
-                # ✅ المعاملة فشلت على السلسلة
                 log.warning(f"⚠️ المعاملة فشلت على السلسلة للمحفظة {checksum_wallet[:8]}...")
                 
                 if attempt < MAX_RETRY_ATTEMPTS - 1:
-                    # ✅ تحديث nonce للمحاولة التالية
-                    nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
-                    tx["nonce"] = nonce
+                    tx["nonce"] = w3.eth.get_transaction_count(checksum_wallet, "pending")
                     delay = calculate_retry_delay(attempt, {"reason": "transaction_failed", "retryable": True})
                     time.sleep(delay)
                     continue
@@ -456,26 +752,21 @@ def attempt_purchase_single_wallet(
             error_analysis = analyze_error(e)
             log.warning(f"⚠️ محاولة {attempt + 1} فشلت (منطق العقد) للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
             
-            # ✅ إيقاف فوري للأخطاء القاتلة
             if error_analysis["category"] == "fatal":
                 if error_analysis["reason"] in ["sold_out", "already_minted"]:
                     return {"success": False, "wallet": checksum_wallet, "reason": error_analysis["reason"], "error": str(e), "analysis": error_analysis}
             
-            # ✅ إعادة محاولة فقط للأخطاء القابلة
             if not error_analysis["retryable"]:
                 return {"success": False, "wallet": checksum_wallet, "reason": f"contract_reverted_{error_analysis['reason']}", "error": str(e), "analysis": error_analysis}
             
             if attempt == MAX_RETRY_ATTEMPTS - 1:
                 return {"success": False, "wallet": checksum_wallet, "reason": f"contract_reverted_{error_analysis['reason']}", "error": str(e), "analysis": error_analysis}
             
-            # ✅ تأخير ذكي
             delay = calculate_retry_delay(attempt, error_analysis)
             time.sleep(delay)
             
-            # ✅ تحديث nonce
             try:
-                nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
-                tx["nonce"] = nonce
+                tx["nonce"] = w3.eth.get_transaction_count(checksum_wallet, "pending")
             except:
                 pass
             
@@ -483,22 +774,18 @@ def attempt_purchase_single_wallet(
             error_analysis = analyze_error(e)
             log.warning(f"⚠️ محاولة {attempt + 1} فشلت للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
             
-            # ✅ إعادة محاولة فقط للأخطاء القابلة
             if not error_analysis["retryable"]:
                 return {"success": False, "wallet": checksum_wallet, "reason": error_analysis["reason"], "error": str(e), "analysis": error_analysis}
             
             if attempt == MAX_RETRY_ATTEMPTS - 1:
                 return {"success": False, "wallet": checksum_wallet, "reason": error_analysis["reason"], "error": str(e), "analysis": error_analysis}
             
-            # ✅ تأخير ذكي
             delay = calculate_retry_delay(attempt, error_analysis)
             time.sleep(delay)
             
-            # ✅ تحديث nonce لمشاكل nonce
             if error_analysis["reason"] in ["nonce_too_low", "nonce_too_high"]:
                 try:
-                    nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
-                    tx["nonce"] = nonce
+                    tx["nonce"] = w3.eth.get_transaction_count(checksum_wallet, "pending")
                 except:
                     pass
     
@@ -509,7 +796,6 @@ def attempt_purchase_single_wallet(
         "max_attempts": MAX_RETRY_ATTEMPTS
     }
 
-# ✅ دالة إضافية للتحقق من حالة المرحلة على السلسلة
 def get_onchain_phase_info(w3: Web3, nft_contract: str) -> dict:
     """
     جلب معلومات المرحلة الحالية من العقد مباشرة
