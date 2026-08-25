@@ -105,8 +105,7 @@ wallet_locks = {w["wallet"]: asyncio.Lock() for w in WALLETS}
 x_cache = {}
 x_inflight = {}
 slug_cooldown = {}
-purchase_seen = set()
-processed_slugs = set()  # لتتبع المجموعات التي تمت معالجتها
+processed_slugs = set()
 
 # =============================
 # دوال قاعدة البيانات
@@ -118,7 +117,6 @@ def db():
         slug TEXT, wallet TEXT, tx_hash TEXT, quantity INTEGER, status TEXT,
         created INTEGER, PRIMARY KEY(slug, wallet)
     )""")
-    # جدول للمجموعات المعالجة (لمنع التكرار في وضع Polling)
     con.execute("""CREATE TABLE IF NOT EXISTS processed_slugs(
         slug TEXT PRIMARY KEY, processed_at INTEGER
     )""")
@@ -162,11 +160,22 @@ def is_slug_processed(slug: str) -> bool:
         con.close()
         return bool(row)
 
+def count_successful_purchases(slug: str) -> int:
+    """حساب عدد المحافظ التي اشترت بنجاح"""
+    with db_lock:
+        con = db()
+        row = con.execute(
+            "SELECT COUNT(*) FROM purchases WHERE slug=? AND status='success'",
+            (slug,)
+        ).fetchone()
+        con.close()
+        return row[0] if row else 0
+
 # =============================
-# دوال التيليجرام
+# دوال التيليجرام المتقدمة
 # =============================
 
-def send_telegram_message(message: str):
+def send_telegram_message(message: str, parse_mode: str = "HTML"):
     """إرسال رسالة إلى تيليجرام"""
     if not TELEGRAM_ENABLED:
         return
@@ -178,30 +187,97 @@ def send_telegram_message(message: str):
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             payload = {
                 "chat_id": chat_id.strip(),
-                "text": message[:4096],  # حد تيليجرام
-                "parse_mode": "HTML"
+                "text": message[:4096],
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True
             }
             requests.post(url, json=payload, timeout=5)
         except Exception as e:
             log.warning(f"فشل إرسال رسالة تيليجرام: {e}")
 
-def notify_purchase(slug: str, wallet: str, tx_hash: str, quantity: int, status: str):
-    """إرسال إشعار شراء"""
-    if status == "success":
-        msg = f"""✅ <b>شراء ناجح!</b>
-📦 المجموعة: <code>{slug}</code>
-👛 المحفظة: <code>{wallet[:10]}...{wallet[-6:]}</code>
-🔢 الكمية: {quantity}
-🔗 المعاملة: <code>{tx_hash[:20]}...</code>
-🕐 الوقت: {time.strftime('%H:%M:%S')}"""
-    else:
-        msg = f"""❌ <b>فشل الشراء</b>
-📦 المجموعة: <code>{slug}</code>
-👛 المحفظة: <code>{wallet[:10]}...{wallet[-6:]}</code>
-📊 الحالة: {status}
-🕐 الوقت: {time.strftime('%H:%M:%S')}"""
+def format_purchase_message(slug: str, wallet: str, quantity: int, tx_hash: str, 
+                           gas_fee: float, total_wallets: int, successful_wallets: int,
+                           collection_name: str = "", collection_link: str = "") -> str:
+    """تنسيق رسالة الشراء بنفس شكل الصورة"""
+    # اختصار عنوان المحفظة
+    short_wallet = f"{wallet[:6]}...{wallet[-6:]}"
     
-    send_telegram_message(msg)
+    # اختصار هاش المعاملة
+    short_tx = tx_hash[:10] if tx_hash else "N/A"
+    
+    # اسم المجموعة
+    display_name = collection_name or slug
+    
+    # رابط المجموعة
+    if not collection_link and slug:
+        collection_link = f"https://opensea.io/collection/{slug}"
+    
+    # بناء الرسالة
+    message = f"""✅ <b>تم الشراء بنجاح! 😊</b>
+
+<b>📦 {display_name}:</b>
+• <b>المجموعة:</b> <a href="{collection_link}">عرض المجموعة</a>
+• <b>المحفظة:</b> <code>{short_wallet}</code> (دفعة واحدة)
+• <b>الكمية:</b> {quantity} (دفعة واحدة)
+• <b>رسوم الغاز:</b> ${gas_fee:.4f}
+• <b>العاملة:</b> <code>{short_tx}</code>
+• <b>المحافظ المشتركة:</b> {successful_wallets}/{total_wallets}
+• <b>الوقت:</b> {time.strftime('%H:%M:%S')}
+
+---
+<a href="{collection_link}">{display_name}</a>
+{collection_name or slug}"""
+    
+    return message
+
+def format_startup_message() -> str:
+    """تنسيق رسالة بدء النظام"""
+    wallet_count = len(WALLETS)
+    first_wallet = WALLETS[0]["wallet"][:8] if WALLETS else "N/A"
+    
+    message = f"""🚀 <b>تم تشغيل النظام بنجاح!</b>
+
+👛 <b>المحافظ:</b> {wallet_count} محفظة
+💰 <b>حد الغاز:</b> ${MAX_GAS_FEE_USD}
+📦 <b>الحد الأقصى للشراء:</b> {MAX_BUY_QTY}
+⚡ <b>التوازي:</b> {MAX_PARALLEL_DISCOVERY}
+🔄 <b>وضع الفحص:</b> {'WebSocket + Polling' if BOT_ENABLED else 'متوقف'}
+
+🕐 <b>الوقت:</b> {time.strftime('%H:%M:%S')}
+"""
+    return message
+
+def format_error_message(error: str, slug: str = "") -> str:
+    """تنسيق رسالة الخطأ"""
+    message = f"""⚠️ <b>خطأ في النظام</b>
+{f'📦 المجموعة: {slug}' if slug else ''}
+❌ {error}
+🕐 {time.strftime('%H:%M:%S')}"""
+    return message
+
+def notify_purchase(slug: str, wallet: str, quantity: int, tx_hash: str, 
+                    gas_fee: float, total_wallets: int, successful_wallets: int,
+                    collection_name: str = "", collection_link: str = ""):
+    """إرسال إشعار شراء بالتنسيق الجديد"""
+    if not tx_hash:
+        return
+    
+    message = format_purchase_message(
+        slug, wallet, quantity, tx_hash, gas_fee,
+        total_wallets, successful_wallets,
+        collection_name, collection_link
+    )
+    send_telegram_message(message)
+
+def notify_startup():
+    """إرسال إشعار بدء النظام"""
+    message = format_startup_message()
+    send_telegram_message(message)
+
+def notify_error(error: str, slug: str = ""):
+    """إرسال إشعار خطأ"""
+    message = format_error_message(error, slug)
+    send_telegram_message(message)
 
 # =============================
 # دوال OpenSea API
@@ -254,7 +330,7 @@ def opensea_x(slug: str):
                 x = value
                 break
 
-    x_cache[slug] = {"value": x, "temporary": False, "expires": now + 3600}  # TTL ساعة
+    x_cache[slug] = {"value": x, "temporary": False, "expires": now + 3600}
     x_inflight.pop(slug, None)
     return x, False
 
@@ -279,8 +355,9 @@ def get_remaining_supply(detail: dict) -> int:
 # دوال الشراء الأساسية
 # =============================
 
-async def one_wallet(slug: str, contract: str, remaining: int, wallet_data: dict):
-    """تنفيذ عملية شراء من محفظة واحدة"""
+async def one_wallet(slug: str, contract: str, remaining: int, wallet_data: dict,
+                     collection_name: str = "", collection_link: str = ""):
+    """تنفيذ عملية شراء من محفظة واحدة مع إشعارات محسنة"""
     wallet = wallet_data["wallet"]
     async with wallet_locks[wallet]:
         if was_purchased(slug, wallet):
@@ -293,7 +370,7 @@ async def one_wallet(slug: str, contract: str, remaining: int, wallet_data: dict
                 wallet_data["private_key"],
                 wallet,
                 contract,
-                3000,  # ETH_PRICE_USD (يمكن جلبها من API)
+                3000,  # ETH_PRICE_USD
                 MAX_GAS_FEE_USD,
                 remaining,
                 MAX_BUY_QTY,
@@ -301,21 +378,37 @@ async def one_wallet(slug: str, contract: str, remaining: int, wallet_data: dict
             )
             
             status = "success" if res.get("success") else ("pending" if res.get("pending") else "failed")
-            if res.get("tx_hash"):
-                save_purchase(slug, wallet, res["tx_hash"], int(res.get("quantity", 0)), status)
-                notify_purchase(slug, wallet, res["tx_hash"], int(res.get("quantity", 0)), status)
             
-            if res.get("success"):
-                log.info(f"✅ {slug} | wallet={wallet[:10]} | quantity={res['quantity']} | tx={res['tx_hash']}")
+            if res.get("tx_hash"):
+                quantity = int(res.get("quantity", 0))
+                gas_fee = float(res.get("gas_fee_usd", 0))
+                
+                save_purchase(slug, wallet, res["tx_hash"], quantity, status)
+                
+                if res.get("success"):
+                    # حساب عدد المحافظ الناجحة
+                    successful = count_successful_purchases(slug)
+                    total = len(WALLETS)
+                    
+                    # إرسال إشعار نجاح بالتنسيق الجديد
+                    notify_purchase(
+                        slug, wallet, quantity, res["tx_hash"], gas_fee,
+                        total, successful, collection_name, collection_link
+                    )
+                    log.info(f"✅ {slug} | wallet={wallet[:10]} | quantity={quantity} | tx={res['tx_hash'][:10]}")
+                else:
+                    # إرسال إشعار فشل
+                    notify_error(f"فشل الشراء: {res.get('reason', 'unknown')}", slug)
+                    
             elif res.get("reason") not in ("not_free", "not_started", "phase_ended"):
                 log.warning(f"❌ {slug} | wallet={wallet[:10]} | {res.get('reason')}")
                 
         except Exception as e:
             log.exception(f"buyer error {slug}/{wallet[:10]}: {e}")
+            notify_error(str(e)[:200], slug)
 
 async def process_slug(slug: str, detail: dict):
-    """معالجة مجموعة جديدة"""
-    # منع التكرار
+    """معالجة مجموعة جديدة مع تمرير اسم المجموعة للإشعارات"""
     now = time.time()
     if now < slug_cooldown.get(slug, 0):
         return
@@ -341,16 +434,20 @@ async def process_slug(slug: str, detail: dict):
         log.warning(f"❌ {slug}: no contract address")
         return
     
+    # استخراج اسم المجموعة
+    collection_name = detail.get("name") or detail.get("collection") or slug
+    collection_link = f"https://opensea.io/collection/{slug}"
+    
     # حساب الكمية المتبقية
     remaining = get_remaining_supply(detail)
     log.info(f"🎯 {slug}: X={x} | starting on-chain validation | remaining={remaining}")
     
-    # تنفيذ الشراء من جميع المحافظ (مع التحكم في التوازي)
+    # تنفيذ الشراء من جميع المحافظ
     semaphore = asyncio.Semaphore(MAX_PARALLEL_DISCOVERY)
     
     async def limited_wallet(w):
         async with semaphore:
-            await one_wallet(slug, contract, remaining, w)
+            await one_wallet(slug, contract, remaining, w, collection_name, collection_link)
     
     await asyncio.gather(*(limited_wallet(w) for w in WALLETS))
     
@@ -414,7 +511,7 @@ async def polling_loop():
     """الفحص الدوري للمجموعات الجديدة"""
     log.info("🔄 Starting polling mode...")
     
-    # قائمة بالمجموعات الشهيرة أو المطلوبة (يمكن تعديلها)
+    # قائمة بالمجموعات الشهيرة (يمكن تعديلها أو جلبها من API)
     popular_slugs = [
         "azuki", "clonex", "otherdeed", "boredapeyachtclub",
         "mutant-ape-yacht-club", "doodles-official", "meebits"
@@ -424,11 +521,10 @@ async def polling_loop():
         try:
             for slug in popular_slugs:
                 if not is_slug_processed(slug):
-                    # جلب تفاصيل المجموعة
                     data, status = get_os_collection(slug)
                     if status == "ok" and data:
                         await process_slug(slug, data)
-                await asyncio.sleep(0.5)  # بين كل مجموعة
+                await asyncio.sleep(0.5)
             
             await asyncio.sleep(POLL_INTERVAL)
             
@@ -448,11 +544,15 @@ async def main():
     log.info(f"⚡ Parallel: {MAX_PARALLEL_DISCOVERY}")
     log.info(f"📱 Telegram: {'✅ Enabled' if TELEGRAM_ENABLED else '❌ Disabled'}")
     
+    # إرسال إشعار بدء النظام
     if TELEGRAM_ENABLED:
-        send_telegram_message("🚀 <b>NFT Bot Started</b>\nBot is now active and monitoring for new collections!")
+        notify_startup()
+        log.info("📱 تم إرسال إشعار بدء النظام إلى تيليجرام")
     
     if not WALLETS:
         log.warning("⚠️ No wallets configured! Please add wallets to .env")
+        if TELEGRAM_ENABLED:
+            notify_error("لا توجد محافظ مضافة! يرجى إضافة المحافظ في ملف .env")
         return
     
     if not BOT_ENABLED:
@@ -462,7 +562,7 @@ async def main():
     # تشغيل كلا الوضعين معاً
     tasks = []
     
-    # WebSocket (إذا كان متاحاً)
+    # WebSocket
     try:
         import websockets
         tasks.append(asyncio.create_task(stream_loop()))
@@ -470,7 +570,7 @@ async def main():
     except ImportError:
         log.warning("⚠️ WebSocket not available, using polling mode only")
     
-    # Polling (كاحتياطي أو بديل)
+    # Polling
     tasks.append(asyncio.create_task(polling_loop()))
     log.info("🔄 Polling mode enabled")
     
