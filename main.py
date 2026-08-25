@@ -1,5 +1,5 @@
 """
-main.py - النظام الكامل مع اكتشاف جميع المراحل المختلفة
+main.py - النظام الكامل مع إشعارات محدودة (بدء + شراء فقط)
 """
 
 import asyncio
@@ -86,6 +86,16 @@ _in_flight: Set[str] = set()
 _rejected_cooldown: Dict[str, float] = {}
 _twitter_cache = {}
 _drop_cache = {}
+
+# ✅ إحصائيات البوت
+bot_stats = {
+    "start_time": time.time(),
+    "mints_detected": 0,
+    "mints_purchased": 0,
+    "purchase_attempts": 0,
+    "errors": 0,
+    "wallets_used": set(),
+}
 
 # ==================== التيليجرام ====================
 
@@ -186,16 +196,6 @@ class TelegramSender:
                 await asyncio.sleep(1 * (attempt + 1))
         
         return False
-    
-    async def test_connection(self):
-        """اختبار الاتصال بالتيليجرام"""
-        test_msg = (
-            f"🧪 <b>اختبار الاتصال</b>\n\n"
-            f"✅ البوت يعمل\n"
-            f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
-            f"📊 عدد المحافظ: {len(self.bot_tokens)}"
-        )
-        await self.send_to_all(test_msg)
 
 telegram = TelegramSender()
 
@@ -285,12 +285,18 @@ def get_available_quantity(detail: dict) -> int:
         log.error(f"❌ خطأ في جلب الكمية: {e}")
         return 1
 
-# ==================== ✅ اكتشاف جميع المراحل ====================
+def get_uptime() -> str:
+    """الحصول على مدة التشغيل"""
+    seconds = int(time.time() - bot_stats["start_time"])
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{hours}h {minutes}m {seconds}s"
+
+# ==================== ✅ تحليل المراحل (للإستخدام الداخلي فقط) ====================
 
 def analyze_all_stages(detail: dict) -> dict:
-    """
-    تحليل شامل لجميع مراحل المينت
-    """
+    """تحليل شامل لجميع مراحل المينت (للاستخدام الداخلي)"""
     eth_price_usd = get_eth_price_usd()
     
     stages = {
@@ -313,14 +319,13 @@ def analyze_all_stages(detail: dict) -> dict:
         }
     }
     
-    # ✅ 1. المرحلة الحالية (active_stage)
+    # المرحلة الحالية
     current = detail.get("active_stage")
     if current:
         stage_info = parse_stage(current, "active", eth_price_usd)
         stages["active"] = stage_info
         stages["total_stages"] += 1
         
-        # تصنيف حسب النوع
         stage_type = stage_info["type"]
         if stage_type in stages["stage_types"]:
             stages["stage_types"][stage_type].append(stage_info)
@@ -331,7 +336,7 @@ def analyze_all_stages(detail: dict) -> dict:
         else:
             stages["paid_stages"].append(stage_info)
     
-    # ✅ 2. المراحل القادمة (next_stages)
+    # المراحل القادمة
     next_stages = detail.get("next_stages", [])
     for stage in next_stages:
         stage_info = parse_stage(stage, "upcoming", eth_price_usd)
@@ -350,7 +355,7 @@ def analyze_all_stages(detail: dict) -> dict:
         else:
             stages["paid_stages"].append(stage_info)
     
-    # ✅ 3. المراحل السابقة (past_stages)
+    # المراحل السابقة
     past_stages = detail.get("past_stages", [])
     for stage in past_stages:
         stage_info = parse_stage(stage, "past", eth_price_usd)
@@ -360,16 +365,13 @@ def analyze_all_stages(detail: dict) -> dict:
     return stages
 
 def parse_stage(stage: dict, status: str, eth_price_usd: float) -> dict:
-    """
-    تحليل مرحلة واحدة
-    """
+    """تحليل مرحلة واحدة"""
     price_wei = int(stage.get("price", "0"))
     price_usd = (price_wei / 1e18) * eth_price_usd
     is_free = price_usd < FREE_PRICE_THRESHOLD_USD or price_wei == 0
     
     stage_type = stage.get("type", "unknown").lower()
     
-    # تحديد نوع المرحلة بدقة
     if is_free:
         stage_type = "free"
     elif stage_type in ["public", "open"]:
@@ -383,165 +385,42 @@ def parse_stage(stage: dict, status: str, eth_price_usd: float) -> dict:
     elif stage_type in ["early_access", "early"]:
         stage_type = "early_access"
     
-    # تحويل الوقت
-    start_time = stage.get("start_time")
-    end_time = stage.get("end_time")
-    
-    # حساب الوقت المتبقي
-    time_until_start = None
-    time_until_end = None
-    
-    if start_time:
-        try:
-            start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-            now = datetime.now(start_dt.tzinfo)
-            time_until_start = int((start_dt - now).total_seconds())
-            if time_until_start < 0:
-                time_until_start = 0
-        except:
-            pass
-    
-    if end_time:
-        try:
-            end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-            now = datetime.now(end_dt.tzinfo)
-            time_until_end = int((end_dt - now).total_seconds())
-            if time_until_end < 0:
-                time_until_end = 0
-        except:
-            pass
-    
     return {
         "type": stage_type,
         "price_wei": price_wei,
         "price_usd": price_usd,
         "is_free": is_free,
         "status": status,
-        "start_time": start_time,
-        "end_time": end_time,
-        "time_until_start": time_until_start,
-        "time_until_end": time_until_end,
+        "start_time": stage.get("start_time"),
+        "end_time": stage.get("end_time"),
         "max_per_wallet": stage.get("max_per_wallet"),
         "max_total_mintable_by_wallet": stage.get("max_total_mintable_by_wallet"),
         "is_eligible": not (stage_type in ["team", "allowlist", "presale", "early_access"]),
         "requires_verification": stage_type in ["team", "allowlist", "presale", "early_access"]
     }
 
-def format_stages_message(slug: str, detail: dict, stages: dict) -> str:
-    """
-    تنسيق رسالة المراحل للإرسال في التيليجرام
-    """
-    name = detail.get("collection_name") or slug
-    collection_url = get_collection_url(slug)
-    
-    lines = [
-        f"📢 <b>اكتشاف مينت جديد</b>\n",
-        f"📦 <b>{name}</b>",
-        f"🌐 <a href='{collection_url}'>عرض المجموعة</a>",
-        f"📊 إجمالي المراحل: <b>{stages['total_stages']}</b>\n",
-        "━━━━━━━━━━━━━━━━━━━"
-    ]
-    
-    # ✅ المرحلة الحالية
-    if stages["active"]:
-        stage = stages["active"]
-        status_emoji = "🟢" if stage["status"] == "active" else "⏳"
-        price_text = "مجاني 🎁" if stage["is_free"] else f"${stage['price_usd']:.4f}"
-        eligible = "✅ مؤهل" if stage["is_eligible"] else "❌ غير مؤهل"
-        
-        lines.append(f"\n🔴 <b>المرحلة الحالية</b>")
-        lines.append(f"  {status_emoji} النوع: <b>{stage['type'].upper()}</b>")
-        lines.append(f"  💰 السعر: {price_text}")
-        lines.append(f"  ✅ الحالة: {eligible}")
-        
-        if stage["max_per_wallet"]:
-            lines.append(f"  🔢 حد المحفظة: {stage['max_per_wallet']}")
-        
-        if stage["time_until_end"] is not None:
-            lines.append(f"  ⏳ ينتهي خلال: {format_time(stage['time_until_end'])}")
-    
-    # ✅ المراحل القادمة
-    if stages["upcoming"]:
-        lines.append(f"\n⏳ <b>المراحل القادمة</b>")
-        for stage in stages["upcoming"]:
-            price_text = "مجاني 🎁" if stage["is_free"] else f"${stage['price_usd']:.4f}"
-            eligible = "✅ مؤهل" if stage["is_eligible"] else "❌ غير مؤهل"
-            
-            lines.append(f"  📌 <b>{stage['type'].upper()}</b>")
-            lines.append(f"     💰 {price_text} | {eligible}")
-            
-            if stage["time_until_start"] is not None:
-                lines.append(f"     ⏳ يبدأ خلال: {format_time(stage['time_until_start'])}")
-    
-    # ✅ المراحل المجانية
-    if stages["free_stages"]:
-        lines.append(f"\n🎁 <b>المراحل المجانية</b>")
-        for stage in stages["free_stages"]:
-            status_text = "نشطة" if stage["status"] == "active" else "قادمة"
-            lines.append(f"  ✅ <b>{stage['type'].upper()}</b> ({status_text})")
-            if stage["status"] == "active":
-                lines.append(f"     🟢 <b>متاحة الآن!</b>")
-    
-    # ✅ الملخص
-    lines.append("\n━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📊 ملخص المراحل:")
-    lines.append(f"  🟢 نشطة: {1 if stages['active'] else 0}")
-    lines.append(f"  ⏳ قادمة: {len(stages['upcoming'])}")
-    lines.append(f"  🔴 منتهية: {len(stages['past'])}")
-    lines.append(f"  🎁 مجانية: {len(stages['free_stages'])}")
-    
-    if stages["has_free_active"]:
-        lines.append("\n🔥 <b>مرحلة مجانية نشطة!</b> جارٍ الشراء...")
-    
-    return "\n".join(lines)
-
-def format_time(seconds: int) -> str:
-    """تنسيق الوقت المتبقي"""
-    if seconds < 0:
-        return "انتهى"
-    if seconds < 60:
-        return f"{seconds} ثانية"
-    if seconds < 3600:
-        minutes = seconds // 60
-        return f"{minutes} دقيقة"
-    if seconds < 86400:
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        return f"{hours} ساعة {minutes} دقيقة"
-    days = seconds // 86400
-    return f"{days} يوم"
-
-# ==================== رسائل التيليجرام ====================
+# ==================== ✅ رسائل التيليجرام المحدودة ====================
 
 async def send_startup_message():
+    """🚀 إشعار بدء التشغيل فقط"""
+    wallet_count = len(WALLETS_DATA)
+    uptime = get_uptime()
+    
     msg = (
         f"🚀 <b>تم تشغيل البوت!</b>\n\n"
-        f"📊 عدد المحافظ: <b>{len(WALLETS_DATA)}</b>\n"
+        f"📊 عدد المحافظ: <b>{wallet_count}</b>\n"
         f"🔗 الشبكة: <b>Ink</b>\n"
-        f"⚡ الحالة: <b>جاهز للعمل</b>\n"
-        f"🔄 الوضع: <b>اكتشاف جميع المراحل</b>\n\n"
-        f"💡 في انتظار المينتات الجديدة..."
+        f"⚡ الحالة: <b>جاهز</b>\n"
+        f"🔄 الوضع: <b>اكتشاف تلقائي</b>\n"
+        f"⏰ وقت التشغيل: <b>{uptime}</b>\n\n"
+        f"💡 في انتظار المينتات المجانية..."
     )
+    
     await telegram.send_to_all(msg)
-
-async def send_test_message():
-    msg = (
-        f"✅ <b>البوت يعمل بشكل صحيح</b>\n\n"
-        f"📊 عدد المحافظ: <b>{len(WALLETS_DATA)}</b>\n"
-        f"🕐 الوقت: <b>{datetime.now().strftime('%H:%M:%S')}</b>\n"
-        f"🔗 الشبكة: <b>Ink</b>\n\n"
-        f"📡 جاهز لاكتشاف المينتات..."
-    )
-    await telegram.send_to_all(msg)
-
-async def send_discovery_message(slug: str, detail: dict, stages: dict):
-    """📢 إشعار اكتشاف المينت مع جميع المراحل"""
-    msg = format_stages_message(slug, detail, stages)
-    await telegram.send_to_all(msg)
-    log.info(f"📤 تم إرسال إشعار اكتشاف المينت لـ {slug}")
+    log.info("📤 تم إرسال إشعار بدء التشغيل")
 
 async def send_purchase_message(slug: str, result: dict):
-    """💰 إشعار الشراء مع الرابط والكمية"""
+    """💰 إشعار الشراء الناجح فقط"""
     wallet = result.get('wallet', 'unknown')
     wallet_short = wallet[:8] + "..." + wallet[-6:] if len(wallet) > 14 else wallet
     tx_hash = result.get('tx_hash', '')
@@ -555,6 +434,10 @@ async def send_purchase_message(slug: str, result: dict):
     
     total_purchased = len(_successful_mints.get(slug, set()))
     total_wallets = len(WALLETS_DATA)
+    
+    # ✅ تحديث الإحصائيات
+    bot_stats["mints_purchased"] += 1
+    bot_stats["wallets_used"].add(wallet)
     
     msg = (
         f"💰 <b>تم الشراء بنجاح!</b>\n\n"
@@ -571,27 +454,11 @@ async def send_purchase_message(slug: str, result: dict):
     await telegram.send_to_all(msg)
     log.info(f"📤 تم إرسال إشعار الشراء لـ {slug}")
 
-async def send_error_message(slug: str, error: str):
-    """⚠️ إشعار الخطأ المهم"""
-    important_errors = ["sold_out", "insufficient_funds", "gas_too_high", "balance_too_low"]
-    
-    is_important = any(err in error.lower() for err in important_errors)
-    if not is_important:
-        return
-    
-    tracker = _mint_trackers.get(slug, {})
-    name = tracker.get('name', slug)
-    collection_url = get_collection_url(slug)
-    
-    msg = (
-        f"⚠️ <b>تنبيه</b>\n\n"
-        f"📦 المجموعة: <b>{name}</b>\n"
-        f"🌐 <a href='{collection_url}'>عرض المجموعة</a>\n"
-        f"❌ المشكلة: <code>{error}</code>\n"
-        f"🕐 الوقت: <b>{datetime.now().strftime('%H:%M:%S')}</b>"
-    )
-    
-    await telegram.send_to_all(msg)
+# ❌ إلغاء جميع الإشعارات الأخرى
+# - لا يوجد إشعار اكتشاف المينت
+# - لا يوجد إشعار اختبار
+# - لا يوجد إشعار خطأ
+# - لا يوجد إشعار مراحل
 
 # ==================== نظام الشراء ====================
 
@@ -618,7 +485,7 @@ async def purchase_task_for_wallet(
         )
         quantity = max(1, quantity)
         
-        log.info(f"🔫 محاولة شراء {quantity} (دفعة واحدة) من المحفظة {wallet_addr[:8]}... - {slug}")
+        log.info(f"🔫 محاولة شراء {quantity} من المحفظة {wallet_addr[:8]}... - {slug}")
         
         res = await asyncio.to_thread(
             attempt_purchase_single_wallet,
@@ -633,19 +500,18 @@ async def purchase_task_for_wallet(
                 _successful_mints[slug] = set()
             _successful_mints[slug].add(wallet_addr)
             
+            # ✅ إرسال إشعار الشراء فقط
             await send_purchase_message(slug, res)
             
             log.info(f"✅ شراء {quantity} بنجاح من المحفظة {wallet_addr[:8]}... - {slug}")
         else:
             reason = res.get('reason', 'unknown')
             log.warning(f"❌ فشل شراء من المحفظة {wallet_addr[:8]}... - {slug}: {reason}")
-            
-            await send_error_message(slug, reason)
 
         return res
 
 async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict, price_wei: int = None):
-    """محاولة الشراء من جميع المحافظ بسحب الكمية كاملة"""
+    """محاولة الشراء من جميع المحافظ"""
     
     tracker = _mint_trackers.get(slug)
     if not tracker:
@@ -721,7 +587,7 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict, pric
 # ==================== مراقبة المينتات ====================
 
 async def monitor_mint(slug: str):
-    """مراقبة مينت جديد مع اكتشاف جميع المراحل"""
+    """مراقبة مينت جديد"""
     if slug in _in_flight:
         return
     
@@ -758,7 +624,7 @@ async def monitor_mint(slug: str):
             _in_flight.discard(slug)
             return
         
-        # ✅ تحليل جميع المراحل
+        # ✅ تحليل المراحل (داخلي فقط)
         stages = analyze_all_stages(detail)
         
         # ✅ تخزين معلومات المينت
@@ -768,14 +634,13 @@ async def monitor_mint(slug: str):
             'twitter': twitter_username,
             'has_purchased': False,
             'first_seen': time.time(),
-            'stages': stages  # ✅ تخزين المراحل
+            'stages': stages
         }
         
         log.info(f"✅ '{slug}' يوجد حساب X: @{twitter_username}")
         log.info(f"📊 عدد المراحل: {stages['total_stages']}")
         
-        # ✅ إرسال إشعار باكتشاف المينت وجميع المراحل
-        await send_discovery_message(slug, detail, stages)
+        # ❌ لا يتم إرسال إشعار اكتشاف المينت
         
         # ✅ التحقق من وجود مرحلة مجانية نشطة
         if stages["has_free_active"]:
@@ -788,6 +653,44 @@ async def monitor_mint(slug: str):
         log.error(f"خطأ في مراقبة {slug}: {e}")
     finally:
         _in_flight.discard(slug)
+
+# ==================== مدير المراحل ====================
+
+async def stage_sleep_manager():
+    """يراقب المراحل القادمة ويوقظ عند بدء المرحلة المجانية"""
+    log.info("💤 مدير مراقبة المراحل يعمل...")
+    
+    while True:
+        try:
+            await asyncio.sleep(SLEEP_CHECK_INTERVAL)
+            
+            for slug, tracker in _mint_trackers.items():
+                if tracker.get('has_purchased', False):
+                    continue
+                
+                if slug in _in_flight:
+                    continue
+                
+                # ✅ جلب تفاصيل جديدة
+                found, fresh_detail = await fetch_drop_detail_async(slug)
+                if not found or not fresh_detail:
+                    continue
+                
+                # ✅ تحليل المراحل
+                stages = analyze_all_stages(fresh_detail)
+                
+                # ✅ تحديث المراحل
+                tracker['stages'] = stages
+                tracker['detail'] = fresh_detail
+                
+                # ✅ إذا أصبحت هناك مرحلة مجانية نشطة
+                if stages["has_free_active"] and not tracker.get('has_purchased', False):
+                    log.info(f"🔥 {slug}: أصبحت المرحلة المجانية نشطة! شراء فوري!")
+                    await try_buy_now_multi_wallet(slug, "ink", fresh_detail)
+                
+        except Exception as e:
+            log.error(f"خطأ في مدير المراحل: {e}")
+            await asyncio.sleep(1)
 
 # ==================== الاستماع إلى OpenSea ====================
 
@@ -867,66 +770,31 @@ async def listen_opensea():
             log.error(f"❌ خطأ في الاتصال: {e}")
             await asyncio.sleep(3)
 
-# ==================== مدير النوم للمراحل ====================
-
-async def stage_sleep_manager():
-    """يراقب المراحل القادمة ويوقظ عند بدء المرحلة المجانية"""
-    log.info("💤 مدير مراقبة المراحل يعمل...")
-    
-    while True:
-        try:
-            await asyncio.sleep(SLEEP_CHECK_INTERVAL)
-            
-            for slug, tracker in _mint_trackers.items():
-                if tracker.get('has_purchased', False):
-                    continue
-                
-                if slug in _in_flight:
-                    continue
-                
-                # ✅ جلب تفاصيل جديدة
-                found, fresh_detail = await fetch_drop_detail_async(slug)
-                if not found or not fresh_detail:
-                    continue
-                
-                # ✅ تحليل المراحل
-                stages = analyze_all_stages(fresh_detail)
-                
-                # ✅ تحديث المراحل
-                tracker['stages'] = stages
-                tracker['detail'] = fresh_detail
-                
-                # ✅ إذا أصبحت هناك مرحلة مجانية نشطة
-                if stages["has_free_active"] and not tracker.get('has_purchased', False):
-                    log.info(f"🔥 {slug}: أصبحت المرحلة المجانية نشطة! شراء فوري!")
-                    await try_buy_now_multi_wallet(slug, "ink", fresh_detail)
-                
-        except Exception as e:
-            log.error(f"خطأ في مدير المراحل: {e}")
-            await asyncio.sleep(1)
-
 # ==================== التشغيل الرئيسي ====================
 
 async def run():
     if not BOT_ENABLED:
         log.warning("🔴 BOT_ENABLED=false")
-        await telegram.send_to_all("🔴 البوت في وضع الإيقاف")
+        # ✅ فقط إشعار الإيقاف
+        await telegram.send_to_all("🔴 البوت في وضع الإيقاف (BOT_ENABLED=false)")
         await telegram.start()
         await asyncio.Event().wait()
         return
     
+    # ✅ بدء التيليجرام
     await telegram.start()
+    
+    # ✅ إرسال إشعار بدء التشغيل فقط
     await send_startup_message()
-    await asyncio.sleep(2)
-    await send_test_message()
     
     log.info("🚀 تشغيل البوت!")
     log.info(f"📊 {len(WALLETS_DATA)} محفظة")
-    log.info(f"🔄 وضع اكتشاف جميع المراحل")
+    log.info(f"🔄 وضع اكتشاف المراحل (بدون إشعارات)")
     
+    # ✅ تشغيل المهام
     await asyncio.gather(
         listen_opensea(),
-        stage_sleep_manager(),  # ✅ مراقبة المراحل
+        stage_sleep_manager(),
         telegram.send_queue.join(),
     )
 
